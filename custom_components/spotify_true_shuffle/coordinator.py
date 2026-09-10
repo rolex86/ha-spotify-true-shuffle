@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from collections import deque
 from datetime import datetime, timedelta, timezone
 import logging
@@ -34,6 +35,10 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.state: dict[str, Any] = {}
         self._last_track_seen: str | None = None
         self._target_context_active = False
+        # Rebuilds can be requested by a button and by the coordinator polling loop
+        # at the same time.  Serialize them so two workers cannot clear once and
+        # then append the same queue concurrently.
+        self._rebuild_lock = asyncio.Lock()
 
     @property
     def entity_id(self) -> str:
@@ -275,17 +280,40 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.async_set_updated_data(self.snapshot)
 
     async def async_rebuild_target_remaining(self, force: bool = False) -> None:
-        if self._target_context_active and not force:
-            self.state["pending_target_rebuild"] = True
+        async with self._rebuild_lock:
+            # Another caller may have completed the rebuild while this call was
+            # waiting for the lock.  Non-forced background rebuilds can then exit.
+            if not force and not self.state.get("pending_target_rebuild"):
+                return
+
+            if self._target_context_active and not force:
+                self.state["pending_target_rebuild"] = True
+                await self._save()
+                return
+
+            uris = [self.state["source_tracks"][tid]["uri"] for tid in self.remaining_ids]
+            self.state["pending_target_rebuild"] = False
+            self.state["status"] = "building"
             await self._save()
-            return
-        uris = [self.state["source_tracks"][tid]["uri"] for tid in self.remaining_ids]
-        await self._spotify("playlist_items_clear", playlist_id=self.target_id)
-        for start in range(0, len(uris), 50):
-            await self._spotify("playlist_items_add", playlist_id=self.target_id, uris=",".join(uris[start:start + 50]))
-        self.state["pending_target_rebuild"] = False
-        self.state["status"] = "complete" if not uris and self.state.get("order") else ("running" if self.state.get("order") else "ready")
-        await self._save()
+
+            try:
+                await self._spotify("playlist_items_clear", playlist_id=self.target_id)
+                for start in range(0, len(uris), 50):
+                    await self._spotify(
+                        "playlist_items_add",
+                        playlist_id=self.target_id,
+                        uris=",".join(uris[start:start + 50]),
+                    )
+            except Exception:
+                # A partial target is safe: the source playlist is never touched.
+                # Mark it pending so the next idle poll can clear and rebuild it.
+                self.state["pending_target_rebuild"] = True
+                self.state["status"] = "rebuild_pending"
+                await self._save()
+                raise
+
+            self.state["status"] = "complete" if not uris and self.state.get("order") else ("running" if self.state.get("order") else "ready")
+            await self._save()
 
     async def async_reshuffle_remaining(self) -> None:
         if self._target_context_active:

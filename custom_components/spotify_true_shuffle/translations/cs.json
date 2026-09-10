@@ -1,0 +1,49 @@
+{
+  "title": "Spotify True Shuffle",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Spotify True Shuffle",
+        "description": "Vyber SpotifyPlus a zdrojový/cílový playlist. Názvy playlistů nejsou v kódu napevno; vlož Spotify URL, URI nebo ID.",
+        "data": {
+          "spotifyplus_entity": "Entita SpotifyPlus",
+          "source_playlist": "URL / ID zdrojového playlistu",
+          "target_playlist": "URL / ID True Shuffle playlistu",
+          "artist_gap": "Minimální odstup interpreta (skladby)",
+          "album_gap": "Minimální odstup alba (skladby)",
+          "min_seconds": "Považovat za odehrané po (sekundách)",
+          "min_percent": "Považovat za odehrané po (% skladby)",
+          "sync_interval_minutes": "Interval synchronizace zdroje (minuty)",
+          "poll_interval_seconds": "Interval kontroly přehrávání (sekundy)",
+          "context_only": "Počítat jen přehrávání z True Shuffle playlistu",
+          "auto_new_cycle": "Po dokončení automaticky spustit nové kolo"
+        }
+      }
+    },
+    "error": {
+      "same_playlist": "Zdrojový a cílový playlist musí být různé.",
+      "invalid_playlist": "Neplatná Spotify URL, URI nebo ID playlistu.",
+      "cannot_connect": "Playlisty se nepodařilo načíst přes SpotifyPlus."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Nastavení Spotify True Shuffle",
+        "data": {
+          "spotifyplus_entity": "Entita SpotifyPlus",
+          "source_playlist": "URL / ID zdrojového playlistu",
+          "target_playlist": "URL / ID True Shuffle playlistu",
+          "artist_gap": "Minimální odstup interpreta (skladby)",
+          "album_gap": "Minimální odstup alba (skladby)",
+          "min_seconds": "Považovat za odehrané po (sekundách)",
+          "min_percent": "Považovat za odehrané po (% skladby)",
+          "sync_interval_minutes": "Interval synchronizace zdroje (minuty)",
+          "poll_interval_seconds": "Interval kontroly přehrávání (sekundy)",
+          "context_only": "Počítat jen přehrávání z True Shuffle playlistu",
+          "auto_new_cycle": "Po dokončení automaticky spustit nové kolo"
+        }
+      }
+    }
+  }
+}

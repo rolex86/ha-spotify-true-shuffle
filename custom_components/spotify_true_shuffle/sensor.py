@@ -24,6 +24,8 @@ SENSORS = (
     TrueShuffleSensorDescription(key="source_tracks", name="Source tracks", icon="mdi:playlist-music", value_fn=lambda d: d.get("source_total", 0)),
     TrueShuffleSensorDescription(key="source_unique", name="Unique source tracks", icon="mdi:playlist-check", value_fn=lambda d: d.get("source_unique", 0)),
     TrueShuffleSensorDescription(key="duplicates", name="Source duplicates", icon="mdi:content-duplicate", value_fn=lambda d: d.get("source_duplicates", 0)),
+    TrueShuffleSensorDescription(key="target_tracks", name="Target playlist tracks", icon="mdi:playlist-music-outline", value_fn=lambda d: d.get("target_total", 0)),
+    TrueShuffleSensorDescription(key="rebuild_pending", name="Target rebuild pending", icon="mdi:playlist-sync", value_fn=lambda d: "yes" if d.get("pending_target_rebuild") else "no"),
     TrueShuffleSensorDescription(key="cycle", name="Cycle", icon="mdi:sync", value_fn=lambda d: d.get("cycle", 0)),
     TrueShuffleSensorDescription(key="played", name="Played", icon="mdi:check-circle-outline", value_fn=lambda d: d.get("played_count", 0)),
     TrueShuffleSensorDescription(key="remaining", name="Remaining", icon="mdi:playlist-play", value_fn=lambda d: d.get("remaining_count", 0)),

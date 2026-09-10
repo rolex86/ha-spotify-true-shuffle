@@ -35,10 +35,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.state: dict[str, Any] = {}
         self._last_track_seen: str | None = None
         self._target_context_active = False
-        # Rebuilds can be requested by a button and by the coordinator polling loop
-        # at the same time. Serialize them so two workers cannot clear once and
-        # then append the same queue concurrently.
-        self._rebuild_lock = asyncio.Lock()
+        self._target_lock = asyncio.Lock()
 
     @property
     def entity_id(self) -> str:
@@ -56,6 +53,14 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         loaded = await self.store.async_load() or {}
         if loaded.get("source_playlist_id") != self.source_id or loaded.get("target_playlist_id") != self.target_id:
             loaded = {}
+
+        pending_remove = loaded.get("pending_remove", [])
+        pending_defer = loaded.get("pending_defer", [])
+        legacy_pending = bool(loaded.get("pending_target_rebuild", False))
+        pending_full_rebuild = bool(
+            loaded.get("pending_full_rebuild", legacy_pending and not pending_remove and not pending_defer)
+        )
+
         self.state = {
             "source_playlist_id": self.source_id,
             "target_playlist_id": self.target_id,
@@ -72,7 +77,13 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "added_this_cycle": loaded.get("added_this_cycle", 0),
             "cycle_started": loaded.get("cycle_started"),
             "last_sync": loaded.get("last_sync"),
-            "pending_target_rebuild": loaded.get("pending_target_rebuild", False),
+            "pending_remove": pending_remove,
+            "pending_defer": pending_defer,
+            "pending_full_rebuild": pending_full_rebuild,
+            "pending_target_rebuild": legacy_pending or bool(pending_remove or pending_defer or pending_full_rebuild),
+            "target_first_track": loaded.get("target_first_track"),
+            "target_first_track_id": loaded.get("target_first_track_id"),
+            "target_order_ok": loaded.get("target_order_ok"),
             "status": loaded.get("status", "loading"),
             "current_track": None,
             "current_artist": None,
@@ -101,7 +112,6 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return datetime.now(timezone.utc).isoformat()
 
     def _sync_due(self) -> bool:
-        # Populate newly added target metadata immediately after an upgrade.
         if self.state.get("target_total") is None:
             return True
         last = self.state.get("last_sync")
@@ -120,7 +130,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 await self.async_sync_source(force=False)
             await self._async_poll_playback()
             if self.state.get("pending_target_rebuild") and not self._target_context_active:
-                await self.async_rebuild_target_remaining()
+                await self.async_apply_target_changes()
             if self.remaining_count == 0 and self.state.get("order") and self.settings.get(CONF_AUTO_NEW_CYCLE, DEFAULT_AUTO_NEW_CYCLE) and not self._target_context_active:
                 await self.async_start_new_cycle()
             return self.snapshot
@@ -144,6 +154,16 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return len(self.remaining_ids)
 
     @property
+    def expected_first_track_id(self) -> str | None:
+        remaining = self.remaining_ids
+        return remaining[0] if remaining else None
+
+    @property
+    def expected_first_track(self) -> str | None:
+        tid = self.expected_first_track_id
+        return self.state.get("source_tracks", {}).get(tid, {}).get("name") if tid else None
+
+    @property
     def snapshot(self) -> dict[str, Any]:
         unique = len(self.state.get("source_tracks", {}))
         played = len(self.played_set)
@@ -157,6 +177,8 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "played_count": played,
             "remaining_count": remaining,
             "progress_percent": progress,
+            "expected_first_track": self.expected_first_track,
+            "expected_first_track_id": self.expected_first_track_id,
         }
 
     async def async_sync_source(self, force: bool = True) -> None:
@@ -170,6 +192,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if not force and snapshot and snapshot == self.state.get("source_snapshot") and self.state.get("source_tracks"):
             self.state["last_sync"] = self._utcnow_iso()
+            await self._verify_target_order()
             await self._save()
             return
 
@@ -225,7 +248,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             else:
                 self.state["order"] = order
             if additions or removals:
-                self.state["pending_target_rebuild"] = True
+                self._queue_full_rebuild()
         self.state["status"] = "running" if self.state.get("order") else "ready"
         await self._save()
 
@@ -266,6 +289,21 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 album_history.append(track.get("album_id"))
         return result
 
+    def _queue_full_rebuild(self) -> None:
+        self.state["pending_full_rebuild"] = True
+        self.state["pending_remove"] = []
+        self.state["pending_defer"] = []
+        self.state["pending_target_rebuild"] = True
+
+    def _queue_played_removal(self, track_id: str) -> None:
+        pending_defer = [tid for tid in self.state.get("pending_defer", []) if tid != track_id]
+        pending_remove = list(self.state.get("pending_remove", []))
+        if track_id not in pending_remove:
+            pending_remove.append(track_id)
+        self.state["pending_defer"] = pending_defer
+        self.state["pending_remove"] = pending_remove
+        self.state["pending_target_rebuild"] = True
+
     def _defer_skipped_track(self, track_id: str) -> bool:
         """Move an unplayed skipped track to the end of the current cycle."""
         remaining = self.remaining_ids
@@ -278,6 +316,11 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return False
         order.append(track_id)
         self.state["order"] = order
+        if track_id not in self.state.get("pending_remove", []):
+            pending_defer = list(self.state.get("pending_defer", []))
+            if track_id not in pending_defer:
+                pending_defer.append(track_id)
+            self.state["pending_defer"] = pending_defer
         self.state["pending_target_rebuild"] = True
         return True
 
@@ -294,48 +337,95 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.state["skipped"] = 0
         self.state["added_this_cycle"] = 0
         self.state["cycle_started"] = self._utcnow_iso()
-        self.state["pending_target_rebuild"] = True
         self.state["status"] = "building"
+        self._queue_full_rebuild()
         await self._save()
-        await self.async_rebuild_target_remaining(force=True)
+        await self.async_apply_target_changes(force=True)
         self.async_set_updated_data(self.snapshot)
 
     async def async_rebuild_target_remaining(self, force: bool = False) -> None:
-        async with self._rebuild_lock:
-            # Another caller may have completed the rebuild while this call was
-            # waiting for the lock. Non-forced background rebuilds can then exit.
+        """Compatibility wrapper for callers that explicitly request a full rebuild."""
+        self._queue_full_rebuild()
+        await self.async_apply_target_changes(force=force)
+
+    async def async_apply_target_changes(self, force: bool = False) -> None:
+        async with self._target_lock:
             if not force and not self.state.get("pending_target_rebuild"):
                 return
-
             if self._target_context_active and not force:
                 self.state["pending_target_rebuild"] = True
                 await self._save()
                 return
 
-            uris = [self.state["source_tracks"][tid]["uri"] for tid in self.remaining_ids]
-            self.state["pending_target_rebuild"] = False
-            self.state["status"] = "building"
+            self.state["status"] = "updating"
             await self._save()
 
             try:
-                await self._spotify("playlist_items_clear", playlist_id=self.target_id)
-                for start in range(0, len(uris), 50):
-                    await self._spotify(
-                        "playlist_items_add",
-                        playlist_id=self.target_id,
-                        uris=",".join(uris[start:start + 50]),
-                    )
+                if self.state.get("pending_full_rebuild"):
+                    await self._async_full_rebuild_locked()
+                else:
+                    await self._async_incremental_update_locked()
+                await self._verify_target_order()
             except Exception:
-                # A partial target is safe: the source playlist is never touched.
-                # Mark it pending so the next idle poll can clear and rebuild it.
                 self.state["pending_target_rebuild"] = True
-                self.state["status"] = "rebuild_pending"
+                self.state["status"] = "update_pending"
                 await self._save()
                 raise
 
-            self.state["target_total"] = len(uris)
-            self.state["status"] = "complete" if not uris and self.state.get("order") else ("running" if self.state.get("order") else "ready")
+            self.state["pending_target_rebuild"] = False
+            self.state["status"] = "complete" if not self.remaining_ids and self.state.get("order") else ("running" if self.state.get("order") else "ready")
             await self._save()
+
+    async def _async_full_rebuild_locked(self) -> None:
+        uris = [self.state["source_tracks"][tid]["uri"] for tid in self.remaining_ids]
+        await self._spotify("playlist_items_clear", playlist_id=self.target_id)
+        for start in range(0, len(uris), 50):
+            await self._spotify(
+                "playlist_items_add",
+                playlist_id=self.target_id,
+                uris=",".join(uris[start:start + 50]),
+            )
+        self.state["pending_full_rebuild"] = False
+        self.state["pending_remove"] = []
+        self.state["pending_defer"] = []
+        self.state["target_total"] = len(uris)
+
+    async def _async_incremental_update_locked(self) -> None:
+        tracks = self.state.get("source_tracks", {})
+        pending_remove = list(dict.fromkeys(self.state.get("pending_remove", [])))
+        pending_defer = [tid for tid in dict.fromkeys(self.state.get("pending_defer", [])) if tid not in pending_remove]
+
+        remove_uris = [tracks[tid]["uri"] for tid in pending_remove if tid in tracks]
+        for start in range(0, len(remove_uris), 100):
+            await self._spotify(
+                "playlist_items_remove",
+                playlist_id=self.target_id,
+                uris=",".join(remove_uris[start:start + 100]),
+            )
+
+        for tid in pending_defer:
+            track = tracks.get(tid)
+            if not track or tid in self.played_set:
+                continue
+            uri = track["uri"]
+            await self._spotify("playlist_items_remove", playlist_id=self.target_id, uris=uri)
+            await self._spotify("playlist_items_add", playlist_id=self.target_id, uris=uri)
+
+        self.state["pending_remove"] = []
+        self.state["pending_defer"] = []
+        self.state["target_total"] = self.remaining_count
+
+    async def _verify_target_order(self) -> None:
+        page = await self._spotify("get_playlist_items", playlist_id=self.target_id, limit=1, offset=0)
+        self.state["target_total"] = int(page.get("total") or 0)
+        items = page.get("items") or []
+        track = (items[0].get("track") or {}) if items else {}
+        actual_id = track.get("id")
+        actual_name = track.get("name")
+        expected_id = self.expected_first_track_id
+        self.state["target_first_track_id"] = actual_id
+        self.state["target_first_track"] = actual_name
+        self.state["target_order_ok"] = actual_id == expected_id
 
     async def async_reshuffle_remaining(self) -> None:
         if self._target_context_active:
@@ -343,8 +433,8 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         remaining_tracks = [self.state["source_tracks"][tid] for tid in self.remaining_ids]
         played_order = [tid for tid in self.state.get("order", []) if tid in self.played_set]
         self.state["order"] = played_order + self._smart_shuffle(remaining_tracks)
-        self.state["pending_target_rebuild"] = True
-        await self.async_rebuild_target_remaining(force=True)
+        self._queue_full_rebuild()
+        await self.async_apply_target_changes(force=True)
         self.async_set_updated_data(self.snapshot)
 
     async def _async_poll_playback(self) -> None:
@@ -386,7 +476,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 threshold = min(min_seconds, percent_threshold) if min_seconds and percent_threshold else max(min_seconds, percent_threshold)
                 if progress >= threshold:
                     self.state["played"] = [*self.state.get("played", []), track_id]
-                    self.state["pending_target_rebuild"] = True
+                    self._queue_played_removal(track_id)
                     self.state["status"] = "complete" if self.remaining_count == 0 else "running"
                     await self._save()
         elif not context_matches:

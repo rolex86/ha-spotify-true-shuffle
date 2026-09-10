@@ -1,0 +1,11 @@
+{
+  "domain": "spotify_true_shuffle",
+  "name": "Spotify True Shuffle",
+  "codeowners": ["@rolex86"],
+  "config_flow": true,
+  "documentation": "https://github.com/rolex86/ha-spotify-true-shuffle",
+  "issue_tracker": "https://github.com/rolex86/ha-spotify-true-shuffle/issues",
+  "iot_class": "cloud_polling",
+  "integration_type": "service",
+  "version": "0.1.0"
+}

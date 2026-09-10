@@ -1,0 +1,49 @@
+{
+  "title": "Spotify True Shuffle",
+  "config": {
+    "step": {
+      "user": {
+        "title": "Spotify True Shuffle",
+        "description": "Choose SpotifyPlus and the source/target playlists. Playlist names are not hard-coded; paste a Spotify playlist URL, URI or ID.",
+        "data": {
+          "spotifyplus_entity": "SpotifyPlus entity",
+          "source_playlist": "Source playlist URL / ID",
+          "target_playlist": "True Shuffle playlist URL / ID",
+          "artist_gap": "Minimum artist gap (tracks)",
+          "album_gap": "Minimum album gap (tracks)",
+          "min_seconds": "Played after at least (seconds)",
+          "min_percent": "Played after at least (% of track)",
+          "sync_interval_minutes": "Source sync interval (minutes)",
+          "poll_interval_seconds": "Playback check interval (seconds)",
+          "context_only": "Count only playback from the True Shuffle playlist",
+          "auto_new_cycle": "Automatically start a new cycle when finished"
+        }
+      }
+    },
+    "error": {
+      "same_playlist": "Source and target playlist must be different.",
+      "invalid_playlist": "Invalid Spotify playlist URL, URI or ID.",
+      "cannot_connect": "Could not read the playlists through SpotifyPlus."
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Spotify True Shuffle settings",
+        "data": {
+          "spotifyplus_entity": "SpotifyPlus entity",
+          "source_playlist": "Source playlist URL / ID",
+          "target_playlist": "True Shuffle playlist URL / ID",
+          "artist_gap": "Minimum artist gap (tracks)",
+          "album_gap": "Minimum album gap (tracks)",
+          "min_seconds": "Played after at least (seconds)",
+          "min_percent": "Played after at least (% of track)",
+          "sync_interval_minutes": "Source sync interval (minutes)",
+          "poll_interval_seconds": "Playback check interval (seconds)",
+          "context_only": "Count only playback from the True Shuffle playlist",
+          "auto_new_cycle": "Automatically start a new cycle when finished"
+        }
+      }
+    }
+  }
+}

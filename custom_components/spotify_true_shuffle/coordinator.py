@@ -24,6 +24,11 @@ from .const import (
 
 _LOGGER = logging.getLogger(__name__)
 
+# Spotify Connect can briefly report an empty / different context while handing playback
+# between devices (for example phone -> car).  Keep the last True Shuffle track around
+# for a short grace period so we do not lose the transition or edit the playlist mid-handoff.
+CONTEXT_GRACE_SECONDS = 45
+
 
 class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
@@ -85,12 +90,24 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "target_first_track_id": loaded.get("target_first_track_id"),
             "target_order_ok": loaded.get("target_order_ok"),
             "status": loaded.get("status", "loading"),
+            # Persistent playback tracker.  These fields deliberately do not use the
+            # current_ prefix so they survive Home Assistant restarts and Connect handoffs.
+            "tracking_track_id": loaded.get("tracking_track_id"),
+            "tracking_progress_ms": int(loaded.get("tracking_progress_ms") or 0),
+            "tracking_duration_ms": int(loaded.get("tracking_duration_ms") or 0),
+            "tracking_last_seen": loaded.get("tracking_last_seen"),
+            "tracking_context_lost_at": loaded.get("tracking_context_lost_at"),
+            # Live UI-only playback data.
             "current_track": None,
             "current_artist": None,
             "current_track_id": None,
             "current_context": None,
             "current_progress_ms": 0,
         }
+
+        self._last_track_seen = self.state.get("tracking_track_id")
+        if self._last_track_seen and self._last_track_seen in self.played_set:
+            self._clear_tracking()
 
     async def _save(self) -> None:
         await self.store.async_save({k: v for k, v in self.state.items() if not k.startswith("current_")})
@@ -111,6 +128,77 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     def _utcnow_iso() -> str:
         return datetime.now(timezone.utc).isoformat()
 
+    @staticmethod
+    def _parse_iso(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed
+
+    def _tracking_threshold_ms(self, duration_ms: int) -> int:
+        min_seconds = int(self.settings.get(CONF_MIN_SECONDS, DEFAULT_MIN_SECONDS)) * 1000
+        min_percent = int(self.settings.get(CONF_MIN_PERCENT, DEFAULT_MIN_PERCENT))
+        percent_threshold = int(duration_ms * (min_percent / 100.0)) if duration_ms else 0
+        return min(min_seconds, percent_threshold) if min_seconds and percent_threshold else max(min_seconds, percent_threshold)
+
+    def _clear_tracking(self) -> None:
+        self.state["tracking_track_id"] = None
+        self.state["tracking_progress_ms"] = 0
+        self.state["tracking_duration_ms"] = 0
+        self.state["tracking_last_seen"] = None
+        self.state["tracking_context_lost_at"] = None
+        self._last_track_seen = None
+
+    def _mark_played(self, track_id: str) -> bool:
+        if track_id not in self.state.get("source_tracks", {}) or track_id in self.played_set:
+            return False
+        self.state["played"] = [*self.state.get("played", []), track_id]
+        self._queue_played_removal(track_id)
+        self.state["status"] = "complete" if self.remaining_count == 0 else "running"
+        return True
+
+    def _finalize_tracked_track(self, count_skip: bool) -> bool:
+        """Finalize the remembered True Shuffle track before clearing the tracker."""
+        track_id = self.state.get("tracking_track_id")
+        if not track_id:
+            return False
+
+        changed = False
+        if track_id in self.state.get("source_tracks", {}) and track_id not in self.played_set:
+            progress = int(self.state.get("tracking_progress_ms") or 0)
+            duration = int(self.state.get("tracking_duration_ms") or 0)
+            threshold = self._tracking_threshold_ms(duration)
+
+            if progress >= threshold:
+                changed = self._mark_played(track_id) or changed
+            elif count_skip:
+                self.state["skipped"] = int(self.state.get("skipped", 0)) + 1
+                self._defer_skipped_track(track_id)
+                changed = True
+
+        self._clear_tracking()
+        return True or changed
+
+    def _target_update_safe(self) -> bool:
+        """Return True when it is safe to mutate the physical target playlist."""
+        if self._target_context_active:
+            return False
+
+        tracked = self.state.get("tracking_track_id")
+        if not tracked:
+            return True
+
+        lost_at = self._parse_iso(self.state.get("tracking_context_lost_at"))
+        if lost_at is None:
+            return False
+
+        return datetime.now(timezone.utc) - lost_at >= timedelta(seconds=CONTEXT_GRACE_SECONDS)
+
     def _sync_due(self) -> bool:
         if self.state.get("target_total") is None:
             return True
@@ -129,9 +217,9 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if self._sync_due():
                 await self.async_sync_source(force=False)
             await self._async_poll_playback()
-            if self.state.get("pending_target_rebuild") and not self._target_context_active:
+            if self.state.get("pending_target_rebuild") and self._target_update_safe():
                 await self.async_apply_target_changes()
-            if self.remaining_count == 0 and self.state.get("order") and self.settings.get(CONF_AUTO_NEW_CYCLE, DEFAULT_AUTO_NEW_CYCLE) and not self._target_context_active:
+            if self.remaining_count == 0 and self.state.get("order") and self.settings.get(CONF_AUTO_NEW_CYCLE, DEFAULT_AUTO_NEW_CYCLE) and self._target_update_safe():
                 await self.async_start_new_cycle()
             return self.snapshot
         except UpdateFailed:
@@ -250,6 +338,8 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             if additions or removals:
                 self._queue_full_rebuild()
         self.state["status"] = "running" if self.state.get("order") else "ready"
+        if not self.state.get("pending_target_rebuild"):
+            await self._verify_target_order()
         await self._save()
 
     def _smart_shuffle(self, tracks: list[dict[str, Any]]) -> list[str]:
@@ -338,6 +428,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.state["added_this_cycle"] = 0
         self.state["cycle_started"] = self._utcnow_iso()
         self.state["status"] = "building"
+        self._clear_tracking()
         self._queue_full_rebuild()
         await self._save()
         await self.async_apply_target_changes(force=True)
@@ -352,7 +443,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         async with self._target_lock:
             if not force and not self.state.get("pending_target_rebuild"):
                 return
-            if self._target_context_active and not force:
+            if not force and not self._target_update_safe():
                 self.state["pending_target_rebuild"] = True
                 await self._save()
                 return
@@ -428,8 +519,8 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.state["target_order_ok"] = actual_id == expected_id
 
     async def async_reshuffle_remaining(self) -> None:
-        if self._target_context_active:
-            raise UpdateFailed("Cannot reshuffle while the True Shuffle playlist is the active Spotify context")
+        if not self._target_update_safe():
+            raise UpdateFailed("Cannot reshuffle while the True Shuffle playlist is active or Spotify Connect is handing playback between devices")
         remaining_tracks = [self.state["source_tracks"][tid] for tid in self.remaining_ids]
         played_order = [tid for tid in self.state.get("order", []) if tid in self.played_set]
         self.state["order"] = played_order + self._smart_shuffle(remaining_tracks)
@@ -439,19 +530,34 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def _async_poll_playback(self) -> None:
         playback = await self._spotify("get_player_playback_state")
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+
         if playback.get("is_empty"):
             self._target_context_active = False
+            changed = False
+            if self.state.get("tracking_track_id"):
+                lost_at = self._parse_iso(self.state.get("tracking_context_lost_at"))
+                if lost_at is None:
+                    self.state["tracking_context_lost_at"] = now_iso
+                    changed = True
+                elif now - lost_at >= timedelta(seconds=CONTEXT_GRACE_SECONDS):
+                    changed = self._finalize_tracked_track(count_skip=True) or changed
+            if changed:
+                await self._save()
             return
+
         context = playback.get("context") or {}
         context_uri = context.get("uri")
         target_uri = f"spotify:playlist:{self.target_id}"
         context_matches = context_uri == target_uri
-        is_playing = bool(playback.get("is_playing"))
         self._target_context_active = context_matches
 
         item = playback.get("item") or {}
         track_id = item.get("id")
         progress = int(playback.get("progress_ms") or 0)
+        duration = int(item.get("duration_ms") or 0)
+
         self.state["current_track"] = item.get("name")
         artists = item.get("artists") or []
         self.state["current_artist"] = ", ".join(a.get("name") for a in artists if a.get("name")) or None
@@ -460,24 +566,58 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.state["current_progress_ms"] = progress
 
         context_only = bool(self.settings.get(CONF_CONTEXT_ONLY, DEFAULT_CONTEXT_ONLY))
-        eligible = is_playing and track_id and (context_matches or not context_only)
-        if eligible:
-            if self._last_track_seen and self._last_track_seen != track_id and self._last_track_seen not in self.played_set:
-                skipped_track = self._last_track_seen
-                self.state["skipped"] = int(self.state.get("skipped", 0)) + 1
-                self._defer_skipped_track(skipped_track)
-                await self._save()
-            self._last_track_seen = track_id
-            if track_id in self.state.get("source_tracks", {}) and track_id not in self.played_set:
-                duration = int(item.get("duration_ms") or self.state["source_tracks"][track_id].get("duration_ms") or 0)
-                min_seconds = int(self.settings.get(CONF_MIN_SECONDS, DEFAULT_MIN_SECONDS)) * 1000
-                min_percent = int(self.settings.get(CONF_MIN_PERCENT, DEFAULT_MIN_PERCENT))
-                percent_threshold = int(duration * (min_percent / 100.0)) if duration else 0
-                threshold = min(min_seconds, percent_threshold) if min_seconds and percent_threshold else max(min_seconds, percent_threshold)
-                if progress >= threshold:
-                    self.state["played"] = [*self.state.get("played", []), track_id]
-                    self._queue_played_removal(track_id)
-                    self.state["status"] = "complete" if self.remaining_count == 0 else "running"
-                    await self._save()
-        elif not context_matches:
-            self._last_track_seen = None
+        eligible_context = context_matches or not context_only
+        changed = False
+
+        if eligible_context and track_id:
+            # A valid target context returned during the grace period: cancel the handoff timer.
+            if self.state.get("tracking_context_lost_at") is not None:
+                self.state["tracking_context_lost_at"] = None
+                changed = True
+
+            tracked_id = self.state.get("tracking_track_id")
+            if tracked_id and tracked_id != track_id:
+                # We finally saw the next track.  Close the remembered one instead of
+                # blindly forgetting it when Spotify Connect briefly changed context.
+                changed = self._finalize_tracked_track(count_skip=True) or changed
+
+            if track_id in self.state.get("source_tracks", {}):
+                source_track = self.state["source_tracks"][track_id]
+                duration = int(duration or source_track.get("duration_ms") or 0)
+
+                if self.state.get("tracking_track_id") != track_id:
+                    self.state["tracking_track_id"] = track_id
+                    self.state["tracking_progress_ms"] = progress
+                    self.state["tracking_duration_ms"] = duration
+                    self.state["tracking_last_seen"] = now_iso
+                    self._last_track_seen = track_id
+                    changed = True
+                else:
+                    if progress > int(self.state.get("tracking_progress_ms") or 0):
+                        self.state["tracking_progress_ms"] = progress
+                        changed = True
+                    if duration and duration != int(self.state.get("tracking_duration_ms") or 0):
+                        self.state["tracking_duration_ms"] = duration
+                        changed = True
+                    self.state["tracking_last_seen"] = now_iso
+                    self._last_track_seen = track_id
+
+                if track_id not in self.played_set:
+                    tracked_progress = int(self.state.get("tracking_progress_ms") or 0)
+                    threshold = self._tracking_threshold_ms(duration)
+                    if tracked_progress >= threshold:
+                        changed = self._mark_played(track_id) or changed
+
+        else:
+            # Do not throw away the last True Shuffle track immediately.  Spotify Connect
+            # often reports another / empty context for a few polls during a device handoff.
+            if self.state.get("tracking_track_id"):
+                lost_at = self._parse_iso(self.state.get("tracking_context_lost_at"))
+                if lost_at is None:
+                    self.state["tracking_context_lost_at"] = now_iso
+                    changed = True
+                elif now - lost_at >= timedelta(seconds=CONTEXT_GRACE_SECONDS):
+                    changed = self._finalize_tracked_track(count_skip=True) or changed
+
+        if changed:
+            await self._save()

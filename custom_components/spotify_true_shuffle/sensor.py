@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable
 
-from homeassistant.components.sensor import SensorEntity, SensorEntityDescription
+from homeassistant.components.sensor import SensorDeviceClass, SensorEntity, SensorEntityDescription
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import PERCENTAGE
 from homeassistant.core import HomeAssistant
@@ -19,6 +20,22 @@ class TrueShuffleSensorDescription(SensorEntityDescription):
     value_fn: Callable[[dict[str, Any]], Any]
 
 
+def _parse_timestamp(value: Any) -> datetime | None:
+    if not value or not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def _order_state(data: dict[str, Any]) -> str:
+    value = data.get("target_order_ok")
+    if value is None:
+        return "unknown"
+    return "yes" if value else "no"
+
+
 SENSORS = (
     TrueShuffleSensorDescription(key="status", name="Status", icon="mdi:shuffle-variant", value_fn=lambda d: d.get("status")),
     TrueShuffleSensorDescription(key="source_tracks", name="Source tracks", icon="mdi:playlist-music", value_fn=lambda d: d.get("source_total", 0)),
@@ -26,7 +43,7 @@ SENSORS = (
     TrueShuffleSensorDescription(key="duplicates", name="Source duplicates", icon="mdi:content-duplicate", value_fn=lambda d: d.get("source_duplicates", 0)),
     TrueShuffleSensorDescription(key="target_tracks", name="Target playlist tracks", icon="mdi:playlist-music-outline", value_fn=lambda d: d.get("target_total", 0)),
     TrueShuffleSensorDescription(key="rebuild_pending", name="Target rebuild pending", icon="mdi:playlist-sync", value_fn=lambda d: "yes" if d.get("pending_target_rebuild") else "no"),
-    TrueShuffleSensorDescription(key="target_order_ok", name="Target order OK", icon="mdi:playlist-check", value_fn=lambda d: "yes" if d.get("target_order_ok") else "no"),
+    TrueShuffleSensorDescription(key="target_order_ok", name="Target order OK", icon="mdi:playlist-check", value_fn=_order_state),
     TrueShuffleSensorDescription(key="target_first_track", name="Target first track", icon="mdi:playlist-music", value_fn=lambda d: d.get("target_first_track")),
     TrueShuffleSensorDescription(key="expected_first_track", name="Expected first track", icon="mdi:playlist-arrow-right", value_fn=lambda d: d.get("expected_first_track")),
     TrueShuffleSensorDescription(key="cycle", name="Cycle", icon="mdi:sync", value_fn=lambda d: d.get("cycle", 0)),
@@ -39,7 +56,13 @@ SENSORS = (
     TrueShuffleSensorDescription(key="current_artist", name="Current artist", icon="mdi:account-music", value_fn=lambda d: d.get("current_artist")),
     TrueShuffleSensorDescription(key="source_name", name="Source playlist", icon="mdi:playlist-music-outline", value_fn=lambda d: d.get("source_name")),
     TrueShuffleSensorDescription(key="target_name", name="True Shuffle playlist", icon="mdi:shuffle", value_fn=lambda d: d.get("target_name")),
-    TrueShuffleSensorDescription(key="last_sync", name="Last source sync", icon="mdi:cloud-sync-outline", value_fn=lambda d: d.get("last_sync")),
+    TrueShuffleSensorDescription(
+        key="last_sync",
+        name="Last source sync",
+        icon="mdi:cloud-sync-outline",
+        device_class=SensorDeviceClass.TIMESTAMP,
+        value_fn=lambda d: _parse_timestamp(d.get("last_sync")),
+    ),
 )
 
 

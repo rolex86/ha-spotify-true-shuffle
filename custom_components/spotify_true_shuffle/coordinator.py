@@ -29,6 +29,10 @@ _LOGGER = logging.getLogger(__name__)
 # for a short grace period so we do not lose the transition or edit the playlist mid-handoff.
 CONTEXT_GRACE_SECONDS = 45
 
+# A real pause on the True Shuffle context is treated as the end of a listening session
+# after this long. At that point pending played/skipped changes may be flushed safely.
+PAUSE_CLEANUP_SECONDS = 120
+
 # Recent-history reconciliation is a fallback for longer Spotify Connect context losses.
 # Polling it every regular 10 second coordinator tick would be unnecessary API traffic.
 RECENT_HISTORY_INTERVAL_SECONDS = 30
@@ -111,6 +115,9 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "tracking_duration_ms": int(loaded.get("tracking_duration_ms") or 0),
             "tracking_last_seen": loaded.get("tracking_last_seen"),
             "tracking_context_lost_at": loaded.get("tracking_context_lost_at"),
+            # Timestamp set only when Spotify reports the True Shuffle context paused.
+            # It is persisted so an HA restart does not restart the two-minute timer.
+            "target_paused_since": loaded.get("target_paused_since"),
             # Recently-played recovery state. On upgrade from an older version the
             # cursor starts at "now" so old skip events are not counted twice.
             "history_cursor_ms": loaded.get("history_cursor_ms"),
@@ -124,6 +131,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "current_track_id": None,
             "current_context": None,
             "current_progress_ms": 0,
+            "current_is_playing": None,
         }
 
         self._last_track_seen = self.state.get("tracking_track_id")
@@ -222,8 +230,19 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         # Clearing a non-empty tracker is itself a state change.
         return True
 
+    def _target_pause_expired(self) -> bool:
+        paused_since = self._parse_iso(self.state.get("target_paused_since"))
+        if paused_since is None:
+            return False
+        return datetime.now(timezone.utc) - paused_since >= timedelta(seconds=PAUSE_CLEANUP_SECONDS)
+
     def _target_update_safe(self) -> bool:
         """Return True when it is safe to mutate the physical target playlist."""
+        # A genuine paused True Shuffle context becomes a safe cleanup point after
+        # PAUSE_CLEANUP_SECONDS. This deliberately overrides the normal activity grace.
+        if self._target_pause_expired():
+            return True
+
         if self._target_context_active:
             return False
 
@@ -266,7 +285,9 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             # Recent history is a recovery channel, not a hard dependency. A temporary
             # Spotify history failure must not make the whole coordinator unavailable.
             try:
-                await self._async_reconcile_recent_history()
+                # At the two-minute pause boundary force one last history reconciliation
+                # immediately before the physical target playlist is cleaned.
+                await self._async_reconcile_recent_history(force=self._target_pause_expired())
             except Exception as err:  # noqa: BLE001 - keep live tracker operational
                 _LOGGER.warning("Unable to reconcile Spotify recent history: %s", err)
 
@@ -514,6 +535,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.state["history_recovered_played"] = 0
         self.state["history_recovered_skipped"] = 0
         self.state["recent_target_activity_ms"] = 0
+        self.state["target_paused_since"] = None
         self._clear_tracking()
         self._queue_full_rebuild()
         await self._save()
@@ -740,6 +762,8 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
         if playback.get("is_empty"):
             self._target_context_active = False
+            self.state["current_is_playing"] = False
+            self.state["target_paused_since"] = None
             changed = False
             if self.state.get("tracking_track_id"):
                 lost_at = self._parse_iso(self.state.get("tracking_context_lost_at"))
@@ -758,6 +782,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         context_uri = context.get("uri")
         target_uri = f"spotify:playlist:{self.target_id}"
         context_matches = context_uri == target_uri
+        is_playing = bool(playback.get("is_playing"))
         self._target_context_active = context_matches
 
         item = playback.get("item") or {}
@@ -771,15 +796,32 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.state["current_track_id"] = track_id
         self.state["current_context"] = context_uri
         self.state["current_progress_ms"] = progress
+        self.state["current_is_playing"] = is_playing
+
+        changed = False
+
+        if context_matches:
+            if is_playing:
+                if self.state.get("target_paused_since") is not None:
+                    self.state["target_paused_since"] = None
+                    changed = True
+                # Only refresh recent activity while actually playing. If Spotify keeps
+                # the True Shuffle context paused forever, the cleanup timer can expire.
+                self.state["recent_target_activity_ms"] = int(now.timestamp() * 1000)
+            else:
+                if self.state.get("target_paused_since") is None:
+                    self.state["target_paused_since"] = now_iso
+                    changed = True
+        elif self.state.get("target_paused_since") is not None:
+            # A pause timer only describes a paused True Shuffle context. Once Spotify
+            # reports another context, fall back to the normal Connect/history safeguards.
+            self.state["target_paused_since"] = None
+            changed = True
 
         context_only = bool(self.settings.get(CONF_CONTEXT_ONLY, DEFAULT_CONTEXT_ONLY))
         eligible_context = context_matches or not context_only
-        changed = False
 
         if eligible_context and track_id:
-            if context_matches:
-                self.state["recent_target_activity_ms"] = int(now.timestamp() * 1000)
-
             # A valid target context returned during the grace period: cancel the handoff timer.
             if self.state.get("tracking_context_lost_at") is not None:
                 self.state["tracking_context_lost_at"] = None

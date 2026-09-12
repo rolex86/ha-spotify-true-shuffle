@@ -25,9 +25,18 @@ from .const import (
 _LOGGER = logging.getLogger(__name__)
 
 # Spotify Connect can briefly report an empty / different context while handing playback
-# between devices (for example phone -> car).  Keep the last True Shuffle track around
+# between devices (for example phone -> car). Keep the last True Shuffle track around
 # for a short grace period so we do not lose the transition or edit the playlist mid-handoff.
 CONTEXT_GRACE_SECONDS = 45
+
+# Recent-history reconciliation is a fallback for longer Spotify Connect context losses.
+# Polling it every regular 10 second coordinator tick would be unnecessary API traffic.
+RECENT_HISTORY_INTERVAL_SECONDS = 30
+RECENT_HISTORY_LIMIT = 50
+
+# If recently-played history confirms True Shuffle activity, avoid editing the physical
+# target playlist for a short time even if the live Spotify context is temporarily wrong.
+RECENT_TARGET_ACTIVITY_GRACE_SECONDS = 300
 
 
 class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
@@ -35,7 +44,12 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         self.entry = entry
         self.settings = {**entry.data, **entry.options}
         poll = int(self.settings.get(CONF_POLL_INTERVAL, DEFAULT_POLL_INTERVAL))
-        super().__init__(hass, _LOGGER, name=f"Spotify True Shuffle {entry.entry_id}", update_interval=timedelta(seconds=poll))
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"Spotify True Shuffle {entry.entry_id}",
+            update_interval=timedelta(seconds=poll),
+        )
         self.store = Store(hass, STORE_VERSION, f"{DOMAIN}.{entry.entry_id}")
         self.state: dict[str, Any] = {}
         self._last_track_seen: str | None = None
@@ -90,13 +104,20 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             "target_first_track_id": loaded.get("target_first_track_id"),
             "target_order_ok": loaded.get("target_order_ok"),
             "status": loaded.get("status", "loading"),
-            # Persistent playback tracker.  These fields deliberately do not use the
-            # current_ prefix so they survive Home Assistant restarts and Connect handoffs.
+            # Persistent live playback tracker. These fields deliberately do not use
+            # the current_ prefix so they survive Home Assistant restarts and handoffs.
             "tracking_track_id": loaded.get("tracking_track_id"),
             "tracking_progress_ms": int(loaded.get("tracking_progress_ms") or 0),
             "tracking_duration_ms": int(loaded.get("tracking_duration_ms") or 0),
             "tracking_last_seen": loaded.get("tracking_last_seen"),
             "tracking_context_lost_at": loaded.get("tracking_context_lost_at"),
+            # Recently-played recovery state. On upgrade from an older version the
+            # cursor starts at "now" so old skip events are not counted twice.
+            "history_cursor_ms": loaded.get("history_cursor_ms"),
+            "history_last_check": loaded.get("history_last_check"),
+            "history_recovered_played": int(loaded.get("history_recovered_played") or 0),
+            "history_recovered_skipped": int(loaded.get("history_recovered_skipped") or 0),
+            "recent_target_activity_ms": int(loaded.get("recent_target_activity_ms") or 0),
             # Live UI-only playback data.
             "current_track": None,
             "current_artist": None,
@@ -116,8 +137,11 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if not self.hass.services.has_service(SPOTIFYPLUS_DOMAIN, service):
             raise UpdateFailed(f"SpotifyPlus service {service} is not available")
         response = await self.hass.services.async_call(
-            SPOTIFYPLUS_DOMAIN, service, {"entity_id": self.entity_id, **data},
-            blocking=True, return_response=True,
+            SPOTIFYPLUS_DOMAIN,
+            service,
+            {"entity_id": self.entity_id, **data},
+            blocking=True,
+            return_response=True,
         )
         if not isinstance(response, dict) or "result" not in response:
             raise UpdateFailed(f"SpotifyPlus service {service} returned an invalid response")
@@ -139,6 +163,19 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed
+
+    @staticmethod
+    def _iso_to_ms(value: str | None) -> int:
+        parsed = TrueShuffleCoordinator._parse_iso(value)
+        return int(parsed.timestamp() * 1000) if parsed else 0
+
+    @staticmethod
+    def _history_item_ms(item: dict[str, Any]) -> int:
+        try:
+            value = int(item.get("played_at_ms") or 0)
+        except (TypeError, ValueError):
+            value = 0
+        return value or TrueShuffleCoordinator._iso_to_ms(item.get("played_at"))
 
     def _tracking_threshold_ms(self, duration_ms: int) -> int:
         min_seconds = int(self.settings.get(CONF_MIN_SECONDS, DEFAULT_MIN_SECONDS)) * 1000
@@ -163,7 +200,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         return True
 
     def _finalize_tracked_track(self, count_skip: bool) -> bool:
-        """Finalize the remembered True Shuffle track before clearing the tracker."""
+        """Finalize the remembered live True Shuffle track before clearing the tracker."""
         track_id = self.state.get("tracking_track_id")
         if not track_id:
             return False
@@ -182,11 +219,18 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 changed = True
 
         self._clear_tracking()
-        return True or changed
+        # Clearing a non-empty tracker is itself a state change.
+        return True
 
     def _target_update_safe(self) -> bool:
         """Return True when it is safe to mutate the physical target playlist."""
         if self._target_context_active:
+            return False
+
+        now = datetime.now(timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
+        recent_target_ms = int(self.state.get("recent_target_activity_ms") or 0)
+        if recent_target_ms and now_ms - recent_target_ms < RECENT_TARGET_ACTIVITY_GRACE_SECONDS * 1000:
             return False
 
         tracked = self.state.get("tracking_track_id")
@@ -197,7 +241,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         if lost_at is None:
             return False
 
-        return datetime.now(timezone.utc) - lost_at >= timedelta(seconds=CONTEXT_GRACE_SECONDS)
+        return now - lost_at >= timedelta(seconds=CONTEXT_GRACE_SECONDS)
 
     def _sync_due(self) -> bool:
         if self.state.get("target_total") is None:
@@ -216,11 +260,27 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         try:
             if self._sync_due():
                 await self.async_sync_source(force=False)
+
             await self._async_poll_playback()
+
+            # Recent history is a recovery channel, not a hard dependency. A temporary
+            # Spotify history failure must not make the whole coordinator unavailable.
+            try:
+                await self._async_reconcile_recent_history()
+            except Exception as err:  # noqa: BLE001 - keep live tracker operational
+                _LOGGER.warning("Unable to reconcile Spotify recent history: %s", err)
+
             if self.state.get("pending_target_rebuild") and self._target_update_safe():
                 await self.async_apply_target_changes()
-            if self.remaining_count == 0 and self.state.get("order") and self.settings.get(CONF_AUTO_NEW_CYCLE, DEFAULT_AUTO_NEW_CYCLE) and self._target_update_safe():
+
+            if (
+                self.remaining_count == 0
+                and self.state.get("order")
+                and self.settings.get(CONF_AUTO_NEW_CYCLE, DEFAULT_AUTO_NEW_CYCLE)
+                and self._target_update_safe()
+            ):
                 await self.async_start_new_cycle()
+
             return self.snapshot
         except UpdateFailed:
             raise
@@ -290,25 +350,31 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             page = await self._spotify("get_playlist_items", playlist_id=self.source_id, limit=50, offset=offset)
             if offset == 0:
                 self.state["source_total"] = int(page.get("total") or self.state.get("source_total") or 0)
+
             for item in page.get("items") or []:
                 track = item.get("track") or {}
                 track_id = track.get("id")
                 uri = track.get("uri")
                 if not track_id or not uri or not track.get("is_playable", True):
                     continue
+
                 artists = track.get("artists") or []
                 album = track.get("album") or {}
-                tracks.setdefault(track_id, {
-                    "id": track_id,
-                    "uri": uri,
-                    "name": track.get("name") or track_id,
-                    "duration_ms": int(track.get("duration_ms") or 0),
-                    "artist_ids": [a.get("id") for a in artists if a.get("id")],
-                    "artist_names": [a.get("name") for a in artists if a.get("name")],
-                    "album_id": album.get("id"),
-                    "album_name": album.get("name"),
-                    "added_at": item.get("added_at"),
-                })
+                tracks.setdefault(
+                    track_id,
+                    {
+                        "id": track_id,
+                        "uri": uri,
+                        "name": track.get("name") or track_id,
+                        "duration_ms": int(track.get("duration_ms") or 0),
+                        "artist_ids": [a.get("id") for a in artists if a.get("id")],
+                        "artist_names": [a.get("name") for a in artists if a.get("name")],
+                        "album_id": album.get("id"),
+                        "album_name": album.get("name"),
+                        "added_at": item.get("added_at"),
+                    },
+                )
+
             if not page.get("next"):
                 break
             offset += 50
@@ -318,6 +384,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         new_ids = set(tracks)
         additions = new_ids - old_ids
         removals = old_ids - new_ids
+
         self.state["source_tracks"] = tracks
         self.state["source_snapshot"] = snapshot
         self.state["last_sync"] = self._utcnow_iso()
@@ -326,6 +393,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             order = [tid for tid in self.state["order"] if tid in new_ids]
             played = [tid for tid in self.state.get("played", []) if tid in new_ids]
             self.state["played"] = played
+
             if additions:
                 played_set = set(played)
                 remaining_tracks = [tracks[tid] for tid in order if tid not in played_set] + [tracks[tid] for tid in additions]
@@ -335,8 +403,10 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 self.state["added_this_cycle"] = int(self.state.get("added_this_cycle", 0)) + len(additions)
             else:
                 self.state["order"] = order
+
             if additions or removals:
                 self._queue_full_rebuild()
+
         self.state["status"] = "running" if self.state.get("order") else "ready"
         if not self.state.get("pending_target_rebuild"):
             await self._verify_target_order()
@@ -360,7 +430,8 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     recent_artists = set().union(*list(artist_history)[-a_gap:]) if a_gap and artist_history else set()
                     recent_albums = set(list(album_history)[-al_gap:]) if al_gap and album_history else set()
                     candidates = [
-                        i for i, track in enumerate(remaining)
+                        i
+                        for i, track in enumerate(remaining)
                         if not (set(track.get("artist_ids", [])) & recent_artists)
                         and (not track.get("album_id") or track.get("album_id") not in recent_albums)
                     ]
@@ -369,14 +440,17 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         break
                 if choice_index is not None:
                     break
+
             if choice_index is None:
                 choice_index = rng.randrange(len(remaining))
+
             track = remaining.pop(choice_index)
             result.append(track["id"])
             if artist_gap:
                 artist_history.append(set(track.get("artist_ids", [])))
             if album_gap:
                 album_history.append(track.get("album_id"))
+
         return result
 
     def _queue_full_rebuild(self) -> None:
@@ -399,6 +473,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         remaining = self.remaining_ids
         if track_id not in remaining or not remaining or remaining[-1] == track_id:
             return False
+
         order = list(self.state.get("order", []))
         try:
             order.remove(track_id)
@@ -406,11 +481,13 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             return False
         order.append(track_id)
         self.state["order"] = order
+
         if track_id not in self.state.get("pending_remove", []):
             pending_defer = list(self.state.get("pending_defer", []))
             if track_id not in pending_defer:
                 pending_defer.append(track_id)
             self.state["pending_defer"] = pending_defer
+
         self.state["pending_target_rebuild"] = True
         return True
 
@@ -421,13 +498,22 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
             tracks = list(self.state.get("source_tracks", {}).values())
         if not tracks:
             raise UpdateFailed("Source playlist has no playable tracks")
+
+        now = datetime.now(timezone.utc)
+        now_ms = int(now.timestamp() * 1000)
+
         self.state["cycle"] = int(self.state.get("cycle", 0)) + 1
         self.state["order"] = self._smart_shuffle(tracks)
         self.state["played"] = []
         self.state["skipped"] = 0
         self.state["added_this_cycle"] = 0
-        self.state["cycle_started"] = self._utcnow_iso()
+        self.state["cycle_started"] = now.isoformat()
         self.state["status"] = "building"
+        self.state["history_cursor_ms"] = now_ms
+        self.state["history_last_check"] = now.isoformat()
+        self.state["history_recovered_played"] = 0
+        self.state["history_recovered_skipped"] = 0
+        self.state["recent_target_activity_ms"] = 0
         self._clear_tracking()
         self._queue_full_rebuild()
         await self._save()
@@ -464,7 +550,11 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                 raise
 
             self.state["pending_target_rebuild"] = False
-            self.state["status"] = "complete" if not self.remaining_ids and self.state.get("order") else ("running" if self.state.get("order") else "ready")
+            self.state["status"] = (
+                "complete"
+                if not self.remaining_ids and self.state.get("order")
+                else ("running" if self.state.get("order") else "ready")
+            )
             await self._save()
 
     async def _async_full_rebuild_locked(self) -> None:
@@ -484,7 +574,11 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
     async def _async_incremental_update_locked(self) -> None:
         tracks = self.state.get("source_tracks", {})
         pending_remove = list(dict.fromkeys(self.state.get("pending_remove", [])))
-        pending_defer = [tid for tid in dict.fromkeys(self.state.get("pending_defer", [])) if tid not in pending_remove]
+        pending_defer = [
+            tid
+            for tid in dict.fromkeys(self.state.get("pending_defer", []))
+            if tid not in pending_remove
+        ]
 
         remove_uris = [tracks[tid]["uri"] for tid in pending_remove if tid in tracks]
         for start in range(0, len(remove_uris), 100):
@@ -520,13 +614,124 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
     async def async_reshuffle_remaining(self) -> None:
         if not self._target_update_safe():
-            raise UpdateFailed("Cannot reshuffle while the True Shuffle playlist is active or Spotify Connect is handing playback between devices")
+            raise UpdateFailed(
+                "Cannot reshuffle while the True Shuffle playlist is active or Spotify Connect is handing playback between devices"
+            )
+
         remaining_tracks = [self.state["source_tracks"][tid] for tid in self.remaining_ids]
         played_order = [tid for tid in self.state.get("order", []) if tid in self.played_set]
         self.state["order"] = played_order + self._smart_shuffle(remaining_tracks)
         self._queue_full_rebuild()
         await self.async_apply_target_changes(force=True)
         self.async_set_updated_data(self.snapshot)
+
+    async def _async_reconcile_recent_history(self, force: bool = False) -> None:
+        """Recover target-playlist transitions that the live Spotify context missed.
+
+        Spotify recently-played history contains a played_at timestamp and the playback
+        context for each track. By comparing the start time of one history item with the
+        next item we can estimate how long the first item was listened to. This lets us
+        preserve the normal played-vs-skipped threshold even when Spotify Connect reports
+        the wrong live context for several minutes in a car.
+        """
+        now = datetime.now(timezone.utc)
+        now_iso = now.isoformat()
+        now_ms = int(now.timestamp() * 1000)
+
+        cursor_raw = self.state.get("history_cursor_ms")
+        if cursor_raw is None:
+            # Upgrade baseline: do not replay older history because existing skips may
+            # already have been counted by the pre-history tracker.
+            self.state["history_cursor_ms"] = now_ms
+            self.state["history_last_check"] = now_iso
+            await self._save()
+            return
+
+        cursor = int(cursor_raw or 0)
+        last_check = self._parse_iso(self.state.get("history_last_check"))
+        if (
+            not force
+            and last_check is not None
+            and now - last_check < timedelta(seconds=RECENT_HISTORY_INTERVAL_SECONDS)
+        ):
+            return
+
+        self.state["history_last_check"] = now_iso
+
+        page = await self._spotify(
+            "get_player_recent_tracks",
+            limit=RECENT_HISTORY_LIMIT,
+            after=max(0, cursor),
+            limit_total=RECENT_HISTORY_LIMIT,
+        )
+
+        raw_items = page.get("items") or []
+        events: list[dict[str, Any]] = []
+        for raw in raw_items:
+            if not isinstance(raw, dict):
+                continue
+            played_at_ms = self._history_item_ms(raw)
+            if played_at_ms <= cursor:
+                continue
+            events.append({**raw, "_played_at_ms": played_at_ms})
+
+        events.sort(key=lambda item: int(item.get("_played_at_ms") or 0))
+
+        target_uri = f"spotify:playlist:{self.target_id}"
+        recent_target_ms = int(self.state.get("recent_target_activity_ms") or 0)
+        for event in events:
+            context = event.get("context") or {}
+            if context.get("uri") == target_uri:
+                recent_target_ms = max(recent_target_ms, int(event.get("_played_at_ms") or 0))
+        self.state["recent_target_activity_ms"] = recent_target_ms
+
+        # The newest history event has no known successor yet, so keep it unresolved.
+        # On the next request it will be returned again and can then be classified.
+        new_cursor = cursor
+        recovered_played = 0
+        recovered_skipped = 0
+
+        for index in range(max(0, len(events) - 1)):
+            event = events[index]
+            next_event = events[index + 1]
+            started_ms = int(event.get("_played_at_ms") or 0)
+            next_started_ms = int(next_event.get("_played_at_ms") or 0)
+            if not started_ms or next_started_ms <= started_ms:
+                continue
+
+            new_cursor = max(new_cursor, started_ms)
+            context = event.get("context") or {}
+            if context.get("uri") != target_uri:
+                continue
+
+            track = event.get("track") or {}
+            track_id = track.get("id")
+            if not track_id or track_id not in self.state.get("source_tracks", {}):
+                continue
+            if track_id in self.played_set:
+                continue
+
+            source_track = self.state["source_tracks"][track_id]
+            duration = int(track.get("duration_ms") or source_track.get("duration_ms") or 0)
+            elapsed = max(0, next_started_ms - started_ms)
+            listened_ms = min(elapsed, duration) if duration else elapsed
+            threshold = self._tracking_threshold_ms(duration)
+
+            if listened_ms >= threshold:
+                if self._mark_played(track_id):
+                    recovered_played += 1
+            else:
+                self.state["skipped"] = int(self.state.get("skipped", 0)) + 1
+                self._defer_skipped_track(track_id)
+                recovered_skipped += 1
+
+        self.state["history_cursor_ms"] = new_cursor
+        if recovered_played:
+            self.state["history_recovered_played"] = int(self.state.get("history_recovered_played") or 0) + recovered_played
+        if recovered_skipped:
+            self.state["history_recovered_skipped"] = int(self.state.get("history_recovered_skipped") or 0) + recovered_skipped
+
+        await self._save()
 
     async def _async_poll_playback(self) -> None:
         playback = await self._spotify("get_player_playback_state")
@@ -542,7 +747,9 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.state["tracking_context_lost_at"] = now_iso
                     changed = True
                 elif now - lost_at >= timedelta(seconds=CONTEXT_GRACE_SECONDS):
-                    changed = self._finalize_tracked_track(count_skip=True) or changed
+                    # Recent history is now the authoritative skip fallback. Do not
+                    # increment skipped here or the same play could be counted twice.
+                    changed = self._finalize_tracked_track(count_skip=False) or changed
             if changed:
                 await self._save()
             return
@@ -570,6 +777,9 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
         changed = False
 
         if eligible_context and track_id:
+            if context_matches:
+                self.state["recent_target_activity_ms"] = int(now.timestamp() * 1000)
+
             # A valid target context returned during the grace period: cancel the handoff timer.
             if self.state.get("tracking_context_lost_at") is not None:
                 self.state["tracking_context_lost_at"] = None
@@ -577,9 +787,9 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
 
             tracked_id = self.state.get("tracking_track_id")
             if tracked_id and tracked_id != track_id:
-                # We finally saw the next track.  Close the remembered one instead of
-                # blindly forgetting it when Spotify Connect briefly changed context.
-                changed = self._finalize_tracked_track(count_skip=True) or changed
+                # The live tracker still immediately marks a sufficiently-heard track,
+                # but short tracks / skips are classified later from recent history.
+                changed = self._finalize_tracked_track(count_skip=False) or changed
 
             if track_id in self.state.get("source_tracks", {}):
                 source_track = self.state["source_tracks"][track_id]
@@ -609,7 +819,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                         changed = self._mark_played(track_id) or changed
 
         else:
-            # Do not throw away the last True Shuffle track immediately.  Spotify Connect
+            # Do not throw away the last True Shuffle track immediately. Spotify Connect
             # often reports another / empty context for a few polls during a device handoff.
             if self.state.get("tracking_track_id"):
                 lost_at = self._parse_iso(self.state.get("tracking_context_lost_at"))
@@ -617,7 +827,7 @@ class TrueShuffleCoordinator(DataUpdateCoordinator[dict[str, Any]]):
                     self.state["tracking_context_lost_at"] = now_iso
                     changed = True
                 elif now - lost_at >= timedelta(seconds=CONTEXT_GRACE_SECONDS):
-                    changed = self._finalize_tracked_track(count_skip=True) or changed
+                    changed = self._finalize_tracked_track(count_skip=False) or changed
 
         if changed:
             await self._save()

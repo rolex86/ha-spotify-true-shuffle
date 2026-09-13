@@ -4,11 +4,11 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, PLATFORMS
-from .diagnostic_aware import DiagnosticAwareTrueShuffleCoordinator
+from .relink_aware import RelinkAwareTrueShuffleCoordinator
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    coordinator = DiagnosticAwareTrueShuffleCoordinator(hass, entry)
+    coordinator = RelinkAwareTrueShuffleCoordinator(hass, entry)
     await coordinator.async_initialize()
     await coordinator.async_config_entry_first_refresh()
 

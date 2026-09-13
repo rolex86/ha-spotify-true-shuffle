@@ -6,6 +6,7 @@ import re
 from typing import Any
 
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .const import DOMAIN
 from .target_aware import TargetAwareTrueShuffleCoordinator
@@ -14,21 +15,32 @@ _LOGGER = logging.getLogger(__name__)
 
 PLAYBACK_DIAGNOSTIC_LIMIT = 720
 HISTORY_DIAGNOSTIC_LIMIT = 100
+RATE_LIMIT_DIAGNOSTIC_LIMIT = 100
 HISTORY_SESSION_END_SECONDS = 120
 HISTORY_GENERIC_ERROR_BACKOFF_SECONDS = 900
+GLOBAL_RATE_LIMIT_FALLBACK_SECONDS = 900
+MIN_SAFE_POLL_SECONDS = 15
 
 
 class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
-    """Target-aware coordinator with persistent playback diagnostics and safe history recovery.
+    """Target-aware coordinator with diagnostics and Spotify API rate-limit protection.
 
-    The live tracker behavior is intentionally unchanged. Every playback-state response is
-    stored in a small ring buffer so a later drive can be debugged without the user doing
-    anything while driving. Recently Played is used only after a listening session ends,
-    and any Spotify retry-after value is persisted and respected.
+    The live tracker behavior is intentionally unchanged. Playback responses are stored in
+    a persistent ring buffer so a drive can be inspected afterwards. Recently Played is
+    queried only after a listening session ends. Most importantly, any Spotify 429 response
+    opens one global circuit breaker for every SpotifyPlus service call and the persisted
+    retry-after deadline is respected across Home Assistant restarts and config-entry retries.
     """
 
     def __init__(self, hass, entry) -> None:
         super().__init__(hass, entry)
+
+        # Ten-second polling is unnecessary for a 30-second played threshold and creates
+        # avoidable Spotify API traffic. Existing entries configured below this value are
+        # clamped locally without changing the user's stored options.
+        if self.update_interval and self.update_interval < timedelta(seconds=MIN_SAFE_POLL_SECONDS):
+            self.update_interval = timedelta(seconds=MIN_SAFE_POLL_SECONDS)
+
         self.diagnostic_store = Store(
             hass,
             1,
@@ -37,6 +49,7 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
         self._diagnostics: dict[str, list[dict[str, Any]]] = {
             "playback_polls": [],
             "history_calls": [],
+            "rate_limits": [],
         }
         self._pending_playback_diagnostic: dict[str, Any] | None = None
 
@@ -53,12 +66,22 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
         )
         self.state["target_last_active_at"] = stored.get("target_last_active_at")
 
+        # Global Spotify API circuit breaker. These values live in the main Store so a
+        # config-entry retry or HA restart cannot accidentally hammer Spotify again.
+        self.state["spotify_backoff_until"] = stored.get("spotify_backoff_until")
+        self.state["spotify_rate_limit_service"] = stored.get("spotify_rate_limit_service")
+        self.state["spotify_rate_limit_error"] = stored.get("spotify_rate_limit_error")
+        self.state["spotify_rate_limit_at"] = stored.get("spotify_rate_limit_at")
+        self.state["spotify_rate_limit_retry_after"] = stored.get("spotify_rate_limit_retry_after")
+
         diagnostics = await self.diagnostic_store.async_load() or {}
         playback_polls = diagnostics.get("playback_polls") or []
         history_calls = diagnostics.get("history_calls") or []
+        rate_limits = diagnostics.get("rate_limits") or []
         self._diagnostics = {
             "playback_polls": playback_polls[-PLAYBACK_DIAGNOSTIC_LIMIT:],
             "history_calls": history_calls[-HISTORY_DIAGNOSTIC_LIMIT:],
+            "rate_limits": rate_limits[-RATE_LIMIT_DIAGNOSTIC_LIMIT:],
         }
 
     @property
@@ -70,6 +93,10 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
         data["diagnostic_history_calls"] = len(
             self._diagnostics.get("history_calls", [])
         )
+        data["diagnostic_rate_limits"] = len(
+            self._diagnostics.get("rate_limits", [])
+        )
+        data["spotify_rate_limited"] = self._spotify_backoff_active()
         return data
 
     async def _save_diagnostics(self) -> None:
@@ -90,6 +117,12 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
         self._diagnostics["history_calls"] = calls[-HISTORY_DIAGNOSTIC_LIMIT:]
         await self._save_diagnostics()
 
+    async def _append_rate_limit_diagnostic(self, item: dict[str, Any]) -> None:
+        events = list(self._diagnostics.get("rate_limits", []))
+        events.append(item)
+        self._diagnostics["rate_limits"] = events[-RATE_LIMIT_DIAGNOSTIC_LIMIT:]
+        await self._save_diagnostics()
+
     @staticmethod
     def _retry_after_seconds(err: Exception) -> int | None:
         match = re.search(
@@ -104,6 +137,64 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
         except (TypeError, ValueError):
             return None
 
+    @staticmethod
+    def _is_rate_limit_error(err: Exception) -> bool:
+        text = str(err).lower()
+        return "too many requests" in text or "status: 429" in text or "status 429" in text
+
+    def _spotify_backoff_active(self) -> bool:
+        until = self._parse_iso(self.state.get("spotify_backoff_until"))
+        if until is None:
+            return False
+        return datetime.now(timezone.utc) < until
+
+    def _spotify_backoff_remaining_seconds(self) -> int:
+        until = self._parse_iso(self.state.get("spotify_backoff_until"))
+        if until is None:
+            return 0
+        return max(0, int((until - datetime.now(timezone.utc)).total_seconds()))
+
+    async def _set_global_rate_limit(self, service: str, err: Exception) -> None:
+        now = datetime.now(timezone.utc)
+        retry_after = self._retry_after_seconds(err)
+        backoff_seconds = max(
+            60,
+            retry_after if retry_after is not None else GLOBAL_RATE_LIMIT_FALLBACK_SECONDS,
+        )
+        backoff_until = now + timedelta(seconds=backoff_seconds)
+
+        self.state["spotify_backoff_until"] = backoff_until.isoformat()
+        self.state["spotify_rate_limit_service"] = service
+        self.state["spotify_rate_limit_error"] = str(err)
+        self.state["spotify_rate_limit_at"] = now.isoformat()
+        self.state["spotify_rate_limit_retry_after"] = retry_after
+        self.state["status"] = "rate_limited"
+        await self._save()
+        await self._append_rate_limit_diagnostic(
+            {
+                "at": now.isoformat(),
+                "service": service,
+                "error": str(err),
+                "retry_after_seconds": retry_after,
+                "backoff_until": backoff_until.isoformat(),
+            }
+        )
+
+    async def _clear_expired_global_rate_limit(self) -> None:
+        if not self.state.get("spotify_backoff_until"):
+            return
+        if self._spotify_backoff_active():
+            return
+
+        self.state["spotify_backoff_until"] = None
+        self.state["spotify_rate_limit_service"] = None
+        self.state["spotify_rate_limit_error"] = None
+        self.state["spotify_rate_limit_at"] = None
+        self.state["spotify_rate_limit_retry_after"] = None
+        if self.state.get("status") == "rate_limited":
+            self.state["status"] = "running" if self.state.get("order") else "ready"
+        await self._save()
+
     def _history_backoff_active(self) -> bool:
         until = self._parse_iso(self.state.get("history_backoff_until"))
         if until is None:
@@ -114,7 +205,7 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
         if not self.state.get("history_recovery_pending"):
             return False
 
-        if self._history_backoff_active():
+        if self._spotify_backoff_active() or self._history_backoff_active():
             return False
 
         # A two-minute pause on the target playlist is our normal session-end boundary.
@@ -133,9 +224,25 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
             seconds=HISTORY_SESSION_END_SECONDS
         )
 
+    async def _async_update_data(self) -> dict[str, Any]:
+        """Do zero Spotify API calls while the global circuit breaker is open."""
+        if self._spotify_backoff_active():
+            self.state["status"] = "rate_limited"
+            return self.snapshot
+
+        await self._clear_expired_global_rate_limit()
+        return await super()._async_update_data()
+
     async def _spotify(self, service: str, **data) -> dict[str, Any]:
-        if service != "get_player_playback_state":
-            return await super()._spotify(service, **data)
+        # Buttons, forced syncs and config-entry retries can reach _spotify outside the
+        # normal coordinator update path. Guard every call here as well.
+        if self._spotify_backoff_active():
+            remaining = self._spotify_backoff_remaining_seconds()
+            raise UpdateFailed(
+                f"Spotify API rate-limit circuit breaker active; retry in {remaining} seconds"
+            )
+
+        await self._clear_expired_global_rate_limit()
 
         requested = datetime.now(timezone.utc)
         requested_ms = int(requested.timestamp() * 1000)
@@ -143,15 +250,25 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
             result = await super()._spotify(service, **data)
         except Exception as err:
             received = datetime.now(timezone.utc)
-            self._pending_playback_diagnostic = {
-                "requested_at": requested.isoformat(),
-                "received_at": received.isoformat(),
-                "request_duration_ms": int(
-                    (received - requested).total_seconds() * 1000
-                ),
-                "error": str(err),
-            }
+
+            if service == "get_player_playback_state":
+                self._pending_playback_diagnostic = {
+                    "requested_at": requested.isoformat(),
+                    "received_at": received.isoformat(),
+                    "request_duration_ms": int(
+                        (received - requested).total_seconds() * 1000
+                    ),
+                    "error": str(err),
+                }
+
+            if self._is_rate_limit_error(err):
+                await self._set_global_rate_limit(service, err)
             raise
+
+        # Only playback-state calls need a per-poll diagnostic record. All other Spotify
+        # calls still benefit from the global 429 circuit breaker above.
+        if service != "get_player_playback_state":
+            return result
 
         received = datetime.now(timezone.utc)
         received_ms = int(received.timestamp() * 1000)
@@ -226,6 +343,9 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
                     "history_recovery_pending_after": bool(
                         self.state.get("history_recovery_pending")
                     ),
+                    "spotify_backoff_until_after": self.state.get(
+                        "spotify_backoff_until"
+                    ),
                 }
             )
             await self._append_playback_diagnostic(diagnostic)
@@ -235,8 +355,7 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
 
         The base coordinator calls this method on every update. This override turns those
         calls into cheap no-ops until a real session boundary is reached. Spotify 429
-        retry-after responses are persisted, so Home Assistant will not hammer the
-        endpoint again while Spotify has explicitly asked us to wait.
+        retry-after responses are also handled by the global circuit breaker in _spotify.
         """
         if not self._history_recovery_due():
             return
@@ -273,6 +392,7 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
                     "error": str(err),
                     "retry_after_seconds": retry_after,
                     "backoff_until": self.state.get("history_backoff_until"),
+                    "global_backoff_until": self.state.get("spotify_backoff_until"),
                     "cursor_ms": self.state.get("history_cursor_ms"),
                 }
             )
@@ -293,6 +413,7 @@ class DiagnosticAwareTrueShuffleCoordinator(TargetAwareTrueShuffleCoordinator):
                 "error": None,
                 "retry_after_seconds": None,
                 "backoff_until": None,
+                "global_backoff_until": None,
                 "cursor_ms": self.state.get("history_cursor_ms"),
                 "recovered_played": int(
                     self.state.get("history_recovered_played") or 0

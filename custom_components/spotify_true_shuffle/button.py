@@ -37,7 +37,10 @@ class TrueShuffleButton(CoordinatorEntity, ButtonEntity):
             await self.coordinator.async_start_new_cycle()
         elif self.entity_description.key == "reshuffle":
             await self.coordinator.async_reshuffle_remaining()
-        await self.coordinator.async_request_refresh()
+
+        # Each coordinator action already updates its own state and publishes fresh data.
+        # Do not immediately trigger an extra coordinator refresh/API playback request.
+        self.coordinator.async_set_updated_data(self.coordinator.snapshot)
 
     @property
     def device_info(self) -> DeviceInfo:

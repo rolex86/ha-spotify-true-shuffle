@@ -4,11 +4,11 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 
 from .const import DOMAIN, PLATFORMS
-from .rate_safe import RateSafeTrueShuffleCoordinator
+from .robust_relink import RobustRelinkTrueShuffleCoordinator
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
-    coordinator = RateSafeTrueShuffleCoordinator(hass, entry)
+    coordinator = RobustRelinkTrueShuffleCoordinator(hass, entry)
     await coordinator.async_initialize()
     coordinator.install_spotifyplus_state_listener()
     await coordinator.async_config_entry_first_refresh()

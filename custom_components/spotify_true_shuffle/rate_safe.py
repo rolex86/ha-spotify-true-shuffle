@@ -48,6 +48,7 @@ class RateSafeTrueShuffleCoordinator(RelinkAwareTrueShuffleCoordinator):
     @property
     def snapshot(self) -> dict[str, Any]:
         data = dict(super().snapshot)
+        protected_id = self._paused_protected_track_id()
         data["effective_poll_interval_seconds"] = int(
             self.update_interval.total_seconds() if self.update_interval else 0
         )
@@ -56,7 +57,45 @@ class RateSafeTrueShuffleCoordinator(RelinkAwareTrueShuffleCoordinator):
         data["min_source_sync_interval_minutes"] = MIN_SOURCE_SYNC_INTERVAL_MINUTES
         data["api_calls_since_start"] = self._api_calls_since_start
         data["api_call_counts"] = dict(self._api_call_counts)
+        data["paused_track_protected"] = protected_id is not None
+        data["paused_track_protected_id"] = protected_id
         return data
+
+    def _paused_protected_track_id(self) -> str | None:
+        """Return the played track that must stay physically present while paused.
+
+        A track still counts as played as soon as it crosses the normal threshold. The
+        exception is purely physical: if Spotify is still paused on that exact track in
+        the TRUE SHUFFLE context, keep it in the target playlist so Resume can continue
+        from the saved Spotify position. As soon as playback moves to another track or
+        context, the protection disappears and the already queued removal can run.
+        """
+        target_uri = f"spotify:playlist:{self.target_id}"
+        if self.state.get("current_context") != target_uri:
+            return None
+        if self.state.get("current_is_playing") is not False:
+            return None
+
+        playback_id = self.state.get("current_track_id")
+        tracked_id = self.state.get("tracking_track_id")
+        tracked_playback_id = self.state.get("tracking_playback_track_id")
+
+        canonical_id: str | None = None
+        if tracked_id and (
+            not tracked_playback_id
+            or not playback_id
+            or tracked_playback_id == playback_id
+        ):
+            canonical_id = tracked_id
+
+        if canonical_id is None and playback_id:
+            canonical_id, _match_method = self._resolve_source_track_id(
+                {"id": playback_id}
+            )
+
+        if canonical_id and canonical_id in self.played_set:
+            return canonical_id
+        return None
 
     def install_spotifyplus_state_listener(self) -> None:
         """Wake an idle coordinator when SpotifyPlus reports a meaningful state change."""
@@ -341,51 +380,103 @@ class RateSafeTrueShuffleCoordinator(RelinkAwareTrueShuffleCoordinator):
         self.async_set_updated_data(self.snapshot)
 
     async def async_apply_target_changes(self, force: bool = False) -> None:
-        """Apply writes without scanning the entire target playlist on every cleanup."""
-        if not force and self._target_update_safe():
-            try:
-                # One cheap snapshot request decides whether the expensive full target scan
-                # is needed to preserve a manual deletion/reorder before our own write.
-                meta = await self._spotify("get_playlist", playlist_id=self.target_id)
-                current_snapshot = self._snapshot_id(meta)
-                stored_snapshot = self.state.get("target_snapshot")
-                external_changed = (
-                    stored_snapshot is None
-                    or current_snapshot != stored_snapshot
-                    or bool(self.state.get("target_external_change_pending"))
-                )
-                if external_changed:
-                    await self._async_capture_manual_edits_before_cleanup()
-                    self.state["target_snapshot"] = current_snapshot
-            except Exception as err:  # noqa: BLE001
-                _LOGGER.warning("Unable to check manual target edits before cleanup: %s", err)
+        """Apply writes while preserving the current paused played track.
 
-        # Bypass TargetAware's unconditional post-write full reconciliation. The base
-        # method performs the requested write plus a one-item order verification.
-        await TrueShuffleCoordinator.async_apply_target_changes(self, force=force)
+        The current TRUE SHUFFLE track is already logically Played after the threshold,
+        but deleting it while Spotify is merely paused would make Resume restart elsewhere.
+        Keep that one queued removal pending. Previous played tracks are still removed in
+        the same cleanup. Once Spotify moves to another track/context, protection vanishes
+        and the pending removal is applied normally.
+        """
+        protected_id = None if force else self._paused_protected_track_id()
+        protected_pending = bool(
+            protected_id
+            and protected_id in self.state.get("pending_remove", [])
+        )
 
-        if self.state.get("pending_target_rebuild"):
-            return
+        if protected_pending:
+            # A full rebuild would necessarily delete the protected played track because it
+            # is no longer in remaining_ids. Defer the whole rebuild until Resume/context
+            # changes instead of trying to reconstruct the active Spotify queue.
+            if self.state.get("pending_full_rebuild"):
+                await self._save()
+                return
 
-        self.state["pending_source_additions"] = []
+            original_pending_remove = list(self.state.get("pending_remove", []))
+            self.state["pending_remove"] = [
+                tid for tid in original_pending_remove if tid != protected_id
+            ]
+            has_other_changes = bool(
+                self.state.get("pending_remove")
+                or self.state.get("pending_defer")
+                or self.state.get("pending_full_rebuild")
+            )
+
+            # If this is the only remaining change, do absolutely no Spotify API work.
+            # The coordinator may revisit this every active poll while paused, so this
+            # short-circuit is important for the rate-limit guard rails.
+            if not has_other_changes:
+                self.state["pending_remove"] = original_pending_remove
+                self.state["pending_target_rebuild"] = True
+                await self._save()
+                return
+
+            self.state["pending_target_rebuild"] = True
+
         try:
-            meta = await self._spotify("get_playlist", playlist_id=self.target_id)
-            self.state["target_snapshot"] = self._snapshot_id(meta)
-            self.state["target_name"] = meta.get(
-                "name", self.state.get("target_name") or self.target_id
-            )
-            self.state["target_total"] = int(
-                ((meta.get("tracks") or {}).get("total"))
-                or self.state.get("target_total")
-                or 0
-            )
-            self.state["target_external_change_pending"] = False
-        except Exception as err:  # noqa: BLE001
-            # The write already succeeded. Do not repeat it just because the cheap
-            # metadata refresh failed; a later target check can reconcile the snapshot.
-            self.state["target_external_change_pending"] = True
-            _LOGGER.warning("Unable to refresh target snapshot after cleanup: %s", err)
-        await self._save()
+            if not force and self._target_update_safe():
+                try:
+                    # One cheap snapshot request decides whether the expensive full target
+                    # scan is needed to preserve a manual deletion/reorder before our write.
+                    meta = await self._spotify("get_playlist", playlist_id=self.target_id)
+                    current_snapshot = self._snapshot_id(meta)
+                    stored_snapshot = self.state.get("target_snapshot")
+                    external_changed = (
+                        stored_snapshot is None
+                        or current_snapshot != stored_snapshot
+                        or bool(self.state.get("target_external_change_pending"))
+                    )
+                    if external_changed:
+                        await self._async_capture_manual_edits_before_cleanup()
+                        self.state["target_snapshot"] = current_snapshot
+                except Exception as err:  # noqa: BLE001
+                    _LOGGER.warning("Unable to check manual target edits before cleanup: %s", err)
+
+            # Bypass TargetAware's unconditional post-write full reconciliation. The base
+            # method performs the requested write plus a one-item order verification.
+            await TrueShuffleCoordinator.async_apply_target_changes(self, force=force)
+
+            if self.state.get("pending_target_rebuild"):
+                return
+
+            self.state["pending_source_additions"] = []
+            try:
+                meta = await self._spotify("get_playlist", playlist_id=self.target_id)
+                self.state["target_snapshot"] = self._snapshot_id(meta)
+                self.state["target_name"] = meta.get(
+                    "name", self.state.get("target_name") or self.target_id
+                )
+                self.state["target_total"] = int(
+                    ((meta.get("tracks") or {}).get("total"))
+                    or self.state.get("target_total")
+                    or 0
+                )
+                self.state["target_external_change_pending"] = False
+            except Exception as err:  # noqa: BLE001
+                # The write already succeeded. Do not repeat it just because the cheap
+                # metadata refresh failed; a later target check can reconcile the snapshot.
+                self.state["target_external_change_pending"] = True
+                _LOGGER.warning("Unable to refresh target snapshot after cleanup: %s", err)
+        finally:
+            if protected_pending and protected_id:
+                # Keep exactly one queued copy of the protected removal. This persists
+                # across HA restarts and is consumed automatically after context changes.
+                pending_remove = list(self.state.get("pending_remove", []))
+                if protected_id not in pending_remove:
+                    pending_remove.append(protected_id)
+                self.state["pending_remove"] = pending_remove
+                self.state["pending_target_rebuild"] = True
+            await self._save()
 
     async def _async_full_rebuild_locked(self) -> None:
         """Use Spotify's supported 100-item write batch to halve rebuild requests."""

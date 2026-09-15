@@ -299,6 +299,12 @@ class RateSafeTrueShuffleCoordinator(RelinkAwareTrueShuffleCoordinator):
 
                 artists = track.get("artists") or []
                 album = track.get("album") or {}
+                external_ids = track.get("external_ids") or {}
+                isrc = (
+                    str(external_ids.get("isrc")).strip().upper()
+                    if isinstance(external_ids, dict) and external_ids.get("isrc")
+                    else None
+                )
                 aliases = []
                 for candidate in self._track_id_candidates(track):
                     candidate_id = candidate[0]
@@ -324,6 +330,7 @@ class RateSafeTrueShuffleCoordinator(RelinkAwareTrueShuffleCoordinator):
                         ],
                         "album_id": album.get("id"),
                         "album_name": album.get("name"),
+                        "isrc": isrc,
                         "added_at": item.get("added_at"),
                         "aliases": aliases,
                     },

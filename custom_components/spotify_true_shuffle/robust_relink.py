@@ -7,18 +7,9 @@ from .rate_safe import RateSafeTrueShuffleCoordinator
 
 
 class RobustRelinkTrueShuffleCoordinator(RateSafeTrueShuffleCoordinator):
-    """Rate-safe coordinator with conservative fallbacks for opaque Spotify relinks.
+    """Resolve opaque Spotify relinks and alternate catalogue editions conservatively."""
 
-    Spotify can return a different market/version track ID during live or offline-history
-    playback without exposing a useful id_origin / linked_from mapping. The normal
-    RelinkAware resolver still runs first. Only when that fails do we compare stable
-    metadata and accept a match only when one source item is the unique best candidate.
-    """
-
-    # Offline/market-specific masters can differ by several seconds even when Spotify
-    # presents them as the same song in the same playlist. Keep this deliberately small.
     _MAX_RELAXED_DURATION_DIFF_MS = 10_000
-    _STRONG_DURATION_DIFF_MS = 3_000
 
     _FEAT_GROUP_RE = re.compile(
         r"\s*[\(\[]\s*(?:feat\.?|ft\.?|featuring)\s+[^\)\]]+[\)\]]\s*",
@@ -32,6 +23,12 @@ class RobustRelinkTrueShuffleCoordinator(RateSafeTrueShuffleCoordinator):
         r"\b(?:remix|mix|edit|version|remaster|remastered)\b",
         flags=re.IGNORECASE,
     )
+    _EDITION_MARKER_RE = re.compile(
+        r"\b(?:radio|original|extended|club|remix|mix|edit|version|remaster|remastered)\b",
+        flags=re.IGNORECASE,
+    )
+    _TRAILING_EDITION_RE = re.compile(r"\s+(?:-|–|—)\s+(.+)$", flags=re.IGNORECASE)
+    _BRACKET_GROUP_RE = re.compile(r"\s*[\(\[]([^\)\]]+)[\)\]]\s*$", flags=re.IGNORECASE)
     _NON_WORD_RE = re.compile(r"[^\w]+", flags=re.UNICODE)
 
     @classmethod
@@ -46,18 +43,37 @@ class RobustRelinkTrueShuffleCoordinator(RateSafeTrueShuffleCoordinator):
 
     @classmethod
     def _relaxed_title(cls, value: Any) -> str:
-        """Normalize common Spotify edition labels without deleting useful descriptors.
-
-        Example: "Devils Got You Beat (Nu Disco Remix)" becomes
-        "devils got you beat nu disco", matching the source title
-        "Devils Got You Beat (Nu Disco)". This is only used after all exact-ID and strict
-        metadata matching has failed, and still requires strong artist/duration evidence.
-        """
+        """Remove version words while preserving useful descriptors such as 'nu disco'."""
         text = cls._normalized_title(value)
         if not text:
             return ""
         text = cls._VERSION_WORD_RE.sub(" ", text)
         return " ".join(text.split())
+
+    @classmethod
+    def _edition_base_title(cls, value: Any) -> str:
+        """Strip a trailing edition label such as 'Radio Edit' or 'Original Mix'.
+
+        This intentionally runs only in the final metadata fallback. The resolver still
+        requires matching artists, a close duration and a unique best source candidate.
+        """
+        raw = str(value or "").strip().casefold()
+        if not raw:
+            return ""
+
+        raw = cls._FEAT_GROUP_RE.sub(" ", raw)
+        raw = cls._FEAT_SUFFIX_RE.sub("", raw)
+
+        bracket = cls._BRACKET_GROUP_RE.search(raw)
+        if bracket and cls._EDITION_MARKER_RE.search(bracket.group(1)):
+            raw = raw[: bracket.start()]
+
+        trailing = cls._TRAILING_EDITION_RE.search(raw)
+        if trailing and cls._EDITION_MARKER_RE.search(trailing.group(1)):
+            raw = raw[: trailing.start()]
+
+        raw = cls._NON_WORD_RE.sub(" ", raw)
+        return " ".join(raw.split())
 
     @classmethod
     def _normalized_artist_names(cls, values: Any) -> set[str]:
@@ -83,7 +99,8 @@ class RobustRelinkTrueShuffleCoordinator(RateSafeTrueShuffleCoordinator):
     def _resolve_source_track_id(
         self, track: dict[str, Any]
     ) -> tuple[str | None, str | None]:
-        # Keep all exact ID / id_origin / linked_from / alias and strict metadata logic.
+        # Exact ID / id_origin / linked_from / aliases and the strict legacy metadata
+        # resolver always get first chance.
         source_id, method = super()._resolve_source_track_id(track)
         if source_id is not None:
             return source_id, method
@@ -92,8 +109,6 @@ class RobustRelinkTrueShuffleCoordinator(RateSafeTrueShuffleCoordinator):
         if not source_tracks or not track:
             return None, method
 
-        # If a future/full source refresh has stored ISRC, it is stronger than title based
-        # heuristics and also survives alternate Spotify IDs/masters.
         playback_isrc = self._track_isrc(track)
         if playback_isrc:
             isrc_matches = [
@@ -103,11 +118,11 @@ class RobustRelinkTrueShuffleCoordinator(RateSafeTrueShuffleCoordinator):
             ]
             if len(isrc_matches) == 1:
                 return isrc_matches[0], "isrc"
-            if len(isrc_matches) > 1:
-                return None, "ambiguous_isrc"
+            # Do not stop on duplicate ISRCs; title/artist/duration can still disambiguate.
 
         playback_title = self._normalized_title(track.get("name"))
-        playback_relaxed_title = self._relaxed_title(track.get("name"))
+        playback_relaxed = self._relaxed_title(track.get("name"))
+        playback_base = self._edition_base_title(track.get("name"))
         if not playback_title:
             return None, method
 
@@ -119,15 +134,17 @@ class RobustRelinkTrueShuffleCoordinator(RateSafeTrueShuffleCoordinator):
         playback_artists = self._normalized_artist_names(track.get("artists") or [])
         playback_album = self._normalized_title((track.get("album") or {}).get("name"))
 
-        ranked: list[tuple[int, int, str]] = []
+        ranked: list[tuple[int, int, int, str]] = []
+
         for candidate_id, source in source_tracks.items():
             source_title = self._normalized_title(source.get("name"))
-            source_relaxed_title = self._relaxed_title(source.get("name"))
+            source_relaxed = self._relaxed_title(source.get("name"))
+            source_base = self._edition_base_title(source.get("name"))
+
             strict_title_match = source_title == playback_title
             relaxed_title_match = bool(
-                playback_relaxed_title
-                and source_relaxed_title
-                and source_relaxed_title == playback_relaxed_title
+                (playback_relaxed and source_relaxed == playback_relaxed)
+                or (playback_base and source_base == playback_base)
             )
             if not strict_title_match and not relaxed_title_match:
                 continue
@@ -152,36 +169,39 @@ class RobustRelinkTrueShuffleCoordinator(RateSafeTrueShuffleCoordinator):
             source_artists = self._normalized_artist_names(
                 source.get("artist_names") or []
             )
-            artist_overlap = bool(playback_artists & source_artists)
-            artists_exact = bool(
-                playback_artists
-                and source_artists
-                and playback_artists == source_artists
-            )
-
-            # A weak title-only match is never sufficient for opaque relinks. In
-            # particular, relaxed edition names and >3 s master differences require the
-            # exact same artist set. This keeps the 10-second allowance conservative.
-            if playback_artists and source_artists and not artist_overlap:
-                continue
-            if (not strict_title_match or duration_diff > self._STRONG_DURATION_DIFF_MS) and not artists_exact:
+            overlap = playback_artists & source_artists
+            if playback_artists and source_artists and not overlap:
                 continue
 
-            score = 14 if strict_title_match else 10
-            if artists_exact:
-                score += 8
-            elif artist_overlap:
-                score += 4
+            # Edition-title matching must be backed by real artist evidence. This prevents
+            # generic song names with a similar duration from being auto-resolved.
+            if not strict_title_match and not overlap:
+                continue
+
+            source_isrc = str(source.get("isrc") or "").strip().upper() or None
+            score = 20 if strict_title_match else 12
+
+            if playback_isrc and source_isrc and playback_isrc == source_isrc:
+                score += 50
+
+            if playback_artists and source_artists:
+                if playback_artists == source_artists:
+                    score += 14
+                else:
+                    overlap_count = len(overlap)
+                    smaller = max(1, min(len(playback_artists), len(source_artists)))
+                    score += overlap_count * 4
+                    score += int(6 * (overlap_count / smaller))
 
             if source_duration and playback_duration:
                 if duration_diff <= 100:
-                    score += 6
+                    score += 10
                 elif duration_diff <= 1000:
-                    score += 5
+                    score += 8
                 elif duration_diff <= 3000:
-                    score += 3
+                    score += 6
                 elif duration_diff <= 6000:
-                    score += 2
+                    score += 3
                 else:
                     score += 1
 
@@ -189,34 +209,37 @@ class RobustRelinkTrueShuffleCoordinator(RateSafeTrueShuffleCoordinator):
             if playback_album and source_album and playback_album == source_album:
                 score += 2
 
-            ranked.append((score, -duration_diff, candidate_id))
+            # For a relaxed edition match require a substantial combined signal.
+            if not strict_title_match and score < 28:
+                continue
+
+            ranked.append((score, len(overlap), -duration_diff, candidate_id))
 
         if not ranked:
             return None, method
 
         ranked.sort(reverse=True)
-        best_score = ranked[0][0:2]
+        best_signature = ranked[0][0:3]
         best_ids = [
             candidate_id
-            for score, negative_duration_diff, candidate_id in ranked
-            if (score, negative_duration_diff) == best_score
+            for score, overlap_count, negative_duration_diff, candidate_id in ranked
+            if (score, overlap_count, negative_duration_diff) == best_signature
         ]
-        if len(best_ids) == 1:
-            match_method = (
-                "metadata_normalized"
-                if self._normalized_title(source_tracks[best_ids[0]].get("name"))
-                == playback_title
-                else "metadata_relaxed_title"
-            )
-            return best_ids[0], match_method
+        if len(best_ids) != 1:
+            return None, "ambiguous_relaxed_metadata"
 
-        return None, "ambiguous_relaxed_metadata"
+        best_id = best_ids[0]
+        best_source = source_tracks[best_id]
+        match_method = (
+            "metadata_normalized"
+            if self._normalized_title(best_source.get("name")) == playback_title
+            else "metadata_edition"
+        )
+        return best_id, match_method
 
     async def _spotify(self, service: str, **data) -> dict[str, Any]:
         result = await super()._spotify(service, **data)
 
-        # Keep enough raw relink information in the persistent diagnostics to make future
-        # mismatches immediately obvious without another manual API call during playback.
         if service == "get_player_playback_state" and self._pending_playback_diagnostic:
             item = result.get("item") or {}
             linked_from = item.get("linked_from") or {}

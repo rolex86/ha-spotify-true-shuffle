@@ -27,6 +27,14 @@ class RelinkAwareTrueShuffleCoordinator(DiagnosticAwareTrueShuffleCoordinator):
             "tracking_playback_track_id"
         )
         self.state["tracking_match_method"] = stored.get("tracking_match_method")
+        # History events that could not yet be classified are kept separately from the
+        # API cursor. This lets the cursor advance without permanently losing opaque
+        # relinks or the newest event whose listened duration is not known yet.
+        retry_events = stored.get("history_retry_events") or []
+        self.state["history_retry_events"] = [
+            event for event in retry_events
+            if isinstance(event, dict) and event.get("played_at_ms")
+        ][-100:]
 
     def _clear_tracking(self) -> None:
         super()._clear_tracking()
@@ -416,7 +424,14 @@ class RelinkAwareTrueShuffleCoordinator(DiagnosticAwareTrueShuffleCoordinator):
             await self._append_playback_diagnostic(diagnostic)
 
     async def _async_reconcile_recent_history(self, force: bool = False) -> None:
-        """Recover history using canonical source IDs, including Spotify relinks."""
+        """Recover history without ever losing unresolved or trailing events.
+
+        The Spotify history cursor is only a transport cursor. Events that cannot yet be
+        resolved to a source track, plus the newest target event that has no successor
+        timestamp yet, are persisted in history_retry_events and retried on the next
+        session. This prevents an opaque Spotify relink from being skipped forever merely
+        because the API cursor advanced past it.
+        """
         if not self._history_recovery_due():
             return
 
@@ -424,6 +439,7 @@ class RelinkAwareTrueShuffleCoordinator(DiagnosticAwareTrueShuffleCoordinator):
         before_played = int(self.state.get("history_recovered_played") or 0)
         before_skipped = int(self.state.get("history_recovered_skipped") or 0)
         unresolved = 0
+        retry_before = len(self.state.get("history_retry_events") or [])
 
         try:
             now = datetime.now(timezone.utc)
@@ -434,6 +450,7 @@ class RelinkAwareTrueShuffleCoordinator(DiagnosticAwareTrueShuffleCoordinator):
             if cursor_raw is None:
                 self.state["history_cursor_ms"] = now_ms
                 self.state["history_last_check"] = now_iso
+                self.state["history_retry_events"] = []
                 await self._save()
             else:
                 cursor = int(cursor_raw or 0)
@@ -446,24 +463,53 @@ class RelinkAwareTrueShuffleCoordinator(DiagnosticAwareTrueShuffleCoordinator):
                     limit_total=RECENT_HISTORY_LIMIT,
                 )
 
-                events: list[dict[str, Any]] = []
+                new_events: list[dict[str, Any]] = []
+                max_fetched_ms = cursor
                 for raw in page.get("items") or []:
                     if not isinstance(raw, dict):
                         continue
                     played_at_ms = self._history_item_ms(raw)
                     if played_at_ms <= cursor:
                         continue
-                    events.append({**raw, "_played_at_ms": played_at_ms})
+                    max_fetched_ms = max(max_fetched_ms, played_at_ms)
+                    new_events.append({**raw, "_played_at_ms": played_at_ms})
 
-                events.sort(
-                    key=lambda event: int(event.get("_played_at_ms") or 0)
+                # Merge persisted retry events with newly fetched history. Deduplicate by
+                # played_at timestamp + raw track id; Spotify history timestamps are precise
+                # enough for this purpose and this also avoids double-counting skips.
+                combined: dict[tuple[int, str], dict[str, Any]] = {}
+                for retry in self.state.get("history_retry_events") or []:
+                    played_at_ms = int(retry.get("played_at_ms") or 0)
+                    track = retry.get("track") or {}
+                    track_id = str(track.get("id") or "")
+                    if played_at_ms:
+                        combined[(played_at_ms, track_id)] = {
+                            "context": retry.get("context") or {},
+                            "track": track,
+                            "_played_at_ms": played_at_ms,
+                            "_next_played_at_ms": int(
+                                retry.get("next_played_at_ms") or 0
+                            ),
+                        }
+
+                for event in new_events:
+                    track = event.get("track") or {}
+                    key = (
+                        int(event.get("_played_at_ms") or 0),
+                        str(track.get("id") or ""),
+                    )
+                    combined[key] = event
+
+                events = sorted(
+                    combined.values(),
+                    key=lambda event: int(event.get("_played_at_ms") or 0),
                 )
 
                 target_uri = f"spotify:playlist:{self.target_id}"
                 recent_target_ms = int(
                     self.state.get("recent_target_activity_ms") or 0
                 )
-                for event in events:
+                for event in new_events:
                     context = event.get("context") or {}
                     if context.get("uri") == target_uri:
                         recent_target_ms = max(
@@ -472,28 +518,57 @@ class RelinkAwareTrueShuffleCoordinator(DiagnosticAwareTrueShuffleCoordinator):
                         )
                 self.state["recent_target_activity_ms"] = recent_target_ms
 
-                new_cursor = cursor
                 recovered_played = 0
                 recovered_skipped = 0
+                retry_out: list[dict[str, Any]] = []
 
-                for index in range(max(0, len(events) - 1)):
-                    event = events[index]
-                    next_event = events[index + 1]
+                for index, event in enumerate(events):
                     started_ms = int(event.get("_played_at_ms") or 0)
-                    next_started_ms = int(next_event.get("_played_at_ms") or 0)
-                    if not started_ms or next_started_ms <= started_ms:
+                    if not started_ms:
                         continue
 
-                    new_cursor = max(new_cursor, started_ms)
+                    next_started_ms = 0
+                    if index + 1 < len(events):
+                        next_started_ms = int(
+                            events[index + 1].get("_played_at_ms") or 0
+                        )
+                    if not next_started_ms:
+                        next_started_ms = int(
+                            event.get("_next_played_at_ms") or 0
+                        )
+
                     context = event.get("context") or {}
                     if context.get("uri") != target_uri:
                         continue
 
                     track = event.get("track") or {}
+
+                    # The newest target event cannot be classified until Spotify reports a
+                    # later history item. Keep it independently of the transport cursor.
+                    if next_started_ms <= started_ms:
+                        retry_out.append(
+                            {
+                                "played_at_ms": started_ms,
+                                "next_played_at_ms": 0,
+                                "context": context,
+                                "track": track,
+                            }
+                        )
+                        continue
+
                     canonical_id, _match_method = self._resolve_source_track_id(track)
                     if not canonical_id:
                         unresolved += 1
+                        retry_out.append(
+                            {
+                                "played_at_ms": started_ms,
+                                "next_played_at_ms": next_started_ms,
+                                "context": context,
+                                "track": track,
+                            }
+                        )
                         continue
+
                     if canonical_id in self.played_set:
                         continue
 
@@ -517,7 +592,11 @@ class RelinkAwareTrueShuffleCoordinator(DiagnosticAwareTrueShuffleCoordinator):
                         self._defer_skipped_track(canonical_id)
                         recovered_skipped += 1
 
-                self.state["history_cursor_ms"] = new_cursor
+                # The API cursor may safely move past every fetched event because anything
+                # not fully classified is now persisted in retry_out.
+                self.state["history_cursor_ms"] = max_fetched_ms
+                self.state["history_retry_events"] = retry_out[-100:]
+
                 if recovered_played:
                     self.state["history_recovered_played"] = int(
                         self.state.get("history_recovered_played") or 0
@@ -556,6 +635,10 @@ class RelinkAwareTrueShuffleCoordinator(DiagnosticAwareTrueShuffleCoordinator):
                     "global_backoff_until": self.state.get("spotify_backoff_until"),
                     "cursor_ms": self.state.get("history_cursor_ms"),
                     "unresolved_tracks": unresolved,
+                    "retry_events_before": retry_before,
+                    "retry_events_after": len(
+                        self.state.get("history_retry_events") or []
+                    ),
                 }
             )
             raise
@@ -586,5 +669,9 @@ class RelinkAwareTrueShuffleCoordinator(DiagnosticAwareTrueShuffleCoordinator):
                 )
                 - before_skipped,
                 "unresolved_tracks": unresolved,
+                "retry_events_before": retry_before,
+                "retry_events_after": len(
+                    self.state.get("history_retry_events") or []
+                ),
             }
         )

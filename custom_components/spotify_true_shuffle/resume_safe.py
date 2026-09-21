@@ -1,8 +1,12 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from .robust_relink import RobustRelinkTrueShuffleCoordinator
+
+
+REANCHOR_RETRY_SECONDS = 60
 
 
 class ResumeSafeTrueShuffleCoordinator(RobustRelinkTrueShuffleCoordinator):
@@ -34,6 +38,9 @@ class ResumeSafeTrueShuffleCoordinator(RobustRelinkTrueShuffleCoordinator):
             stored.get("resume_reanchor_pending", False) and protected_id
         )
         self.state["resume_reanchor_last_at"] = stored.get("resume_reanchor_last_at")
+        self.state["resume_reanchor_last_attempt_at"] = stored.get(
+            "resume_reanchor_last_attempt_at"
+        )
         self.state["resume_reanchor_last_error"] = stored.get(
             "resume_reanchor_last_error"
         )
@@ -54,6 +61,9 @@ class ResumeSafeTrueShuffleCoordinator(RobustRelinkTrueShuffleCoordinator):
             self.state.get("resume_reanchor_pending")
         )
         data["resume_reanchor_last_at"] = self.state.get("resume_reanchor_last_at")
+        data["resume_reanchor_last_attempt_at"] = self.state.get(
+            "resume_reanchor_last_attempt_at"
+        )
         data["resume_reanchor_last_error"] = self.state.get(
             "resume_reanchor_last_error"
         )
@@ -114,6 +124,7 @@ class ResumeSafeTrueShuffleCoordinator(RobustRelinkTrueShuffleCoordinator):
             self.state["resume_protected_playback_track_id"] = None
             self.state["resume_protected_since"] = None
             self.state["resume_reanchor_pending"] = False
+            self.state["resume_reanchor_last_attempt_at"] = None
             self.state["resume_reanchor_last_error"] = None
             return True
 
@@ -131,6 +142,17 @@ class ResumeSafeTrueShuffleCoordinator(RobustRelinkTrueShuffleCoordinator):
             self.state["resume_protected_since"] = self._utcnow_iso()
         return changed
 
+    def _resume_reanchor_retry_due(self) -> bool:
+        """Rate-limit retries if Spotify temporarily rejects the queue re-anchor."""
+        last_attempt = self._parse_iso(
+            self.state.get("resume_reanchor_last_attempt_at")
+        )
+        return (
+            last_attempt is None
+            or datetime.now(timezone.utc) - last_attempt
+            >= timedelta(seconds=REANCHOR_RETRY_SECONDS)
+        )
+
     async def _async_reanchor_resumed_track(self, canonical_id: str) -> bool:
         """Rebuild Spotify's queue around the resumed track without losing progress."""
         source_track = self.state.get("source_tracks", {}).get(canonical_id) or {}
@@ -140,14 +162,16 @@ class ResumeSafeTrueShuffleCoordinator(RobustRelinkTrueShuffleCoordinator):
             self.state["resume_reanchor_last_error"] = "protected track has no source URI"
             return False
 
+        self.state["resume_reanchor_last_attempt_at"] = self._utcnow_iso()
         try:
             await self._spotify(
                 "player_media_play_context",
                 context_uri=f"spotify:playlist:{self.target_id}",
                 offset_uri=offset_uri,
                 position_ms=max(0, progress_ms),
+                shuffle=False,
             )
-        except Exception as err:  # noqa: BLE001 - resume must keep working even if reanchor fails
+        except Exception as err:  # noqa: BLE001 - never interrupt normal resumed playback
             self.state["resume_reanchor_last_error"] = str(err)
             return False
 
@@ -181,30 +205,35 @@ class ResumeSafeTrueShuffleCoordinator(RobustRelinkTrueShuffleCoordinator):
             self.state["resume_reanchor_pending"] = True
             changed = True
 
+        canonical_id = self._current_canonical_track_id()
+
+        # A cached Spotify Connect resume may report the TRUE SHUFFLE context correctly,
+        # or it may briefly report no context at all. If the exact protected track comes
+        # back playing, both cases are treated as the same resume and the queue is rebuilt.
+        # An explicit different context is respected and is never hijacked.
+        same_protected_track_resumed = bool(
+            is_playing is True
+            and self.state.get("resume_reanchor_pending")
+            and protected_id_before
+            and canonical_id == protected_id_before
+            and (context_uri == target_uri or not context_uri)
+        )
+
+        if same_protected_track_resumed and self._resume_reanchor_retry_due():
+            if await self._async_reanchor_resumed_track(protected_id_before):
+                changed = True
+                context_uri = target_uri
+            else:
+                # Keep the flag for a rate-limited retry. The user's already-playing
+                # session is never paused or otherwise interrupted on failure.
+                self.state["resume_reanchor_pending"] = True
+                changed = True
+
         if context_uri == target_uri:
-            canonical_id = self._current_canonical_track_id()
-
             if canonical_id:
-                should_reanchor = bool(
-                    is_playing is True
-                    and self.state.get("resume_reanchor_pending")
-                    and protected_id_before
-                    and canonical_id == protected_id_before
-                )
-
                 changed = self._set_resume_protection(
                     canonical_id, playback_id
                 ) or changed
-
-                if should_reanchor:
-                    if await self._async_reanchor_resumed_track(canonical_id):
-                        changed = True
-                    else:
-                        # Keep it pending so a later poll can retry; the normal resumed
-                        # playback continues untouched even if the helper call failed.
-                        self.state["resume_reanchor_pending"] = True
-                        changed = True
-
             elif (
                 is_playing is True
                 and playback_id
@@ -213,9 +242,9 @@ class ResumeSafeTrueShuffleCoordinator(RobustRelinkTrueShuffleCoordinator):
             ):
                 changed = self._set_resume_protection(None, None) or changed
 
-        elif is_playing is True:
-            # Positive playback in another context explicitly ends the TRUE SHUFFLE resume
-            # lifecycle. Idle/empty states do not clear it.
+        elif is_playing is True and context_uri:
+            # A positive, explicit different context means the user chose something else.
+            # Do not redirect that playback back into TRUE SHUFFLE.
             changed = self._set_resume_protection(None, None) or changed
 
         if changed:
